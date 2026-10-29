@@ -1908,6 +1908,7 @@ class CodeFinder:
                     "criticality_score": 0.0,
                     "churn_score": 0.0,
                 },
+                "direction": direction,
             }
 
         if direction == "both":

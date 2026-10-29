@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 
-from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
 from pathlib import Path
 
 if TYPE_CHECKING:
@@ -121,20 +121,93 @@ def _propagation_query(direction: str, depth: int) -> str:
     Upstream finds what calls into the target (arrow points at ``target``);
     downstream finds what the target's output drives (arrow points away from
     ``target``).
+
+    Returns raw ``nodes(p)``/``relationships(p)`` rather than a Cypher list
+    comprehension (``[n in nodes(p) | {...}]``): LadybugDB's binder rejects
+    inline list-comprehension syntax entirely (confirmed live against the
+    `special-order-services` index — "Binder exception: Variable n is not in
+    scope" on even a comprehension with no graph types at all, e.g.
+    ``[x IN range(1,3) | x]``). Shaping each node/relationship happens in
+    Python instead, via ``_portable_node_fields``/``_portable_rel_fields``,
+    mirroring the same portable extraction ``_call_path_edges`` already uses
+    for ``find_all_callers``/``find_all_callees``.
     """
     if direction == "downstream":
         return f"""
             MATCH p = (target)-[:{_IMPACT_REL_TYPES}*1..{depth}]->(sink)
             WHERE target.uid IN $target_uids
-            RETURN [n in nodes(p) | {{uid: n.uid, name: n.name, path: n.path, labels: labels(n)}}] as path_nodes,
-                   [rel in relationships(p) | {{type: type(rel), line_number: coalesce(rel.line_number, 0)}}] as path_rels
+            RETURN nodes(p) as path_nodes, relationships(p) as path_rels
         """
     return f"""
         MATCH p = (source)-[:{_IMPACT_REL_TYPES}*1..{depth}]->(target)
         WHERE target.uid IN $target_uids
-        RETURN [n in nodes(p) | {{uid: n.uid, name: n.name, path: n.path, labels: labels(n)}}] as path_nodes,
-               [rel in relationships(p) | {{type: type(rel), line_number: coalesce(rel.line_number, 0)}}] as path_rels
+        RETURN nodes(p) as path_nodes, relationships(p) as path_rels
     """
+
+
+def _portable_node_fields(node: Any) -> Dict[str, Any]:
+    """Extract uid/name/path/type from one element of ``nodes(p)``.
+
+    Neo4j-driver Node objects expose ``.properties``/``.labels``. LadybugDB
+    and KùzuDB instead return a plain dict with the label spelled flat on the
+    row under ``_LABEL``/``_label`` (see ``viz/server.py``'s ``_meta()`` for
+    the same cross-backend casing distinction, confirmed against a live
+    query on each embedded backend).
+    """
+    props = getattr(node, "properties", node)
+    if not isinstance(props, dict):
+        props = {}
+    labels = getattr(node, "labels", None)
+    if labels:
+        node_type = next(iter(labels))
+    else:
+        node_type = props.get("_LABEL") or props.get("_label") or "Unknown"
+    return {
+        "uid": props.get("uid"),
+        "name": props.get("name"),
+        "path": props.get("path"),
+        "type": node_type,
+    }
+
+
+def _portable_rel_fields(rel: Any) -> Dict[str, Any]:
+    """Extract type/line_number from one element of ``relationships(p)``,
+    mirroring ``_portable_node_fields``'s Neo4j-vs-LadybugDB/KùzuDB handling.
+    """
+    props = getattr(rel, "properties", rel)
+    if not isinstance(props, dict):
+        props = {}
+    rel_type = getattr(rel, "type", None) or props.get("_LABEL") or props.get("_label") or "UNKNOWN"
+    return {"type": rel_type, "line_number": props.get("line_number") or 0}
+
+
+def _leaf_uids_from_paths(paths: List[Dict[str, Any]]) -> List[str]:
+    """Unique leaf-node (last node of each path) uids, in first-seen order."""
+    seen = set()
+    leaves: List[str] = []
+    for path in paths:
+        nodes = path.get("nodes") or []
+        if not nodes:
+            continue
+        leaf_uid = nodes[-1]["uid"]
+        if leaf_uid not in seen:
+            seen.add(leaf_uid)
+            leaves.append(leaf_uid)
+    return leaves
+
+
+def _sanitize_wire_hops(max_wire_hops, default: int = 2) -> int:
+    """Coerce and clamp the wire-hop count for analyze_impact's bridging BFS.
+
+    Unlike ``depth`` this value only bounds a Python loop (it is never
+    interpolated into Cypher), but it still needs a sane ceiling so a bad
+    caller value can't spin the BFS indefinitely.
+    """
+    try:
+        max_wire_hops = int(max_wire_hops)
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(max_wire_hops, 10))
 
 
 def _criticality_query(direction: str) -> str:
@@ -150,6 +223,55 @@ def _criticality_query(direction: str) -> str:
         WHERE target.uid IN $target_uids
         RETURN count(r) as count
     """
+
+
+# Downstream wire-bridging (Task 7): cross PRODUCES_TO/CONSUMES_FROM (GCP
+# Pub/Sub, Piece 1) and SERVES/INVOKES (REST, PR #1728) wire edges from a
+# frontier of function uids into the repo(s) on the other side of the wire.
+#
+# These are three separate queries, run individually in Python, rather than
+# one query combined via OPTIONAL MATCH chains: the plan's own deliberate
+# choice, since it is the simplest Cypher shape and therefore the safest
+# against further LadybugDB dialect variance (see Step 1's finding above —
+# this backend already rejects list comprehensions outright).
+_BRIDGE_PRODUCER_TO_SUBSCRIPTION_CONSUMER = """
+    MATCH (fn)-[:PRODUCES_TO]->(t:Topic)-[:HAS_SUBSCRIPTION]->(s:Subscription)<-[:CONSUMES_FROM]-(consumer_fn)
+    WHERE fn.uid IN $frontier_uids
+    RETURN fn.uid as producer_uid, t.name as topic_name, s.name as subscription_name,
+           consumer_fn.uid as consumer_uid, consumer_fn.name as consumer_name, consumer_fn.path as consumer_path
+"""
+
+_BRIDGE_PRODUCER_TO_TOPIC_CONSUMER = """
+    MATCH (fn)-[:PRODUCES_TO]->(t:Topic)<-[:CONSUMES_FROM]-(consumer_fn)
+    WHERE fn.uid IN $frontier_uids AND NOT (t)-[:HAS_SUBSCRIPTION]->()
+    RETURN fn.uid as producer_uid, t.name as topic_name, null as subscription_name,
+           consumer_fn.uid as consumer_uid, consumer_fn.name as consumer_name, consumer_fn.path as consumer_path
+"""
+
+# Column names deliberately reuse A/B's shape (producer_uid/topic_name/
+# consumer_*) so the BFS loop can process every bridge query's rows
+# identically -- even though here "producer" means "endpoint owner" and
+# "consumer" means "endpoint caller". This is a deliberate shape-reuse, not
+# a copy-paste error.
+_BRIDGE_ENDPOINT_SERVES_INVOKES = """
+    MATCH (fn)-[:SERVES]->(ep:Endpoint)<-[:INVOKES]-(caller_fn)
+    WHERE fn.uid IN $frontier_uids
+    RETURN fn.uid as producer_uid, ep.path as topic_name, null as subscription_name,
+           caller_fn.uid as consumer_uid, caller_fn.name as consumer_name, caller_fn.path as consumer_path
+"""
+
+# A topic reached from the frontier with no Subscription-mediated consumer
+# and no direct consumer either is a true dead end (e.g. a topic that only
+# feeds a BigQuery export subscription, with no indexed consumer function
+# at all) -- reported explicitly in unresolved_crossings rather than just
+# silently stopping the trace there.
+_BRIDGE_DEAD_END_TOPIC = """
+    MATCH (fn)-[:PRODUCES_TO]->(t:Topic)
+    WHERE fn.uid IN $frontier_uids
+      AND NOT (t)-[:HAS_SUBSCRIPTION]->(:Subscription)<-[:CONSUMES_FROM]-()
+      AND NOT (t)<-[:CONSUMES_FROM]-()
+    RETURN DISTINCT t.name as topic_name
+"""
 
 
 def _levenshtein_distance(a: str, b: str) -> int:
@@ -1877,6 +1999,55 @@ class CodeFinder:
                 )
             return rows
 
+    def _bridge_downstream(
+        self, session, frontier_uids: List[str],
+    ) -> Tuple[List[dict], List[str], List[dict]]:
+        """Cross downstream wire edges (Pub/Sub topic/subscription, REST
+        endpoint) from a frontier of function uids into whatever function(s)
+        receive them on the other side.
+
+        Returns ``(new_path_fragments, newly_discovered_function_uids,
+        unresolved_crossings)``:
+
+        - ``new_path_fragments``: one dict per resolved crossing, with the
+          raw ``producer_uid``/``topic_name``/``subscription_name``/
+          ``consumer_uid``/``consumer_name``/``consumer_path`` columns from
+          whichever bridge query matched.
+        - ``newly_discovered_function_uids``: unique ``consumer_uid`` values
+          across all matched crossings, in first-seen order -- the next
+          wire-bridging frontier.
+        - ``unresolved_crossings``: ``{"topic", "reason"}`` entries for
+          topics reached from the frontier with no indexed consumer at all
+          (dead ends), so the trace reports them rather than stopping silently.
+        """
+        if not frontier_uids:
+            return [], [], []
+
+        new_path_fragments: List[dict] = []
+        newly_discovered_uids: List[str] = []
+        seen_uids: set = set()
+
+        for bridge_query in (
+            _BRIDGE_PRODUCER_TO_SUBSCRIPTION_CONSUMER,
+            _BRIDGE_PRODUCER_TO_TOPIC_CONSUMER,
+            _BRIDGE_ENDPOINT_SERVES_INVOKES,
+        ):
+            for row in session.run(bridge_query, frontier_uids=frontier_uids).data():
+                new_path_fragments.append(row)
+                consumer_uid = row.get("consumer_uid")
+                if consumer_uid and consumer_uid not in seen_uids:
+                    seen_uids.add(consumer_uid)
+                    newly_discovered_uids.append(consumer_uid)
+
+        unresolved_crossings: List[dict] = []
+        for row in session.run(_BRIDGE_DEAD_END_TOPIC, frontier_uids=frontier_uids).data():
+            unresolved_crossings.append({
+                "topic": row.get("topic_name"),
+                "reason": "no indexed consumer function found for this topic/subscription",
+            })
+
+        return new_path_fragments, newly_discovered_uids, unresolved_crossings
+
     def analyze_impact(
         self,
         target: str,
@@ -1884,7 +2055,7 @@ class CodeFinder:
         repo_path: Optional[str] = None,
         depth: int = 3,
         direction: str = "upstream",
-        max_wire_hops: int = 2,  # unused until Task 7; accepted now so the signature is stable
+        max_wire_hops: int = 2,  # downstream wire-bridging (Task 7); upstream is Task 8
     ) -> Dict[str, Any]:
         """Analyze semantic code impact and propagation upstream or downstream."""
         import subprocess
@@ -1909,6 +2080,8 @@ class CodeFinder:
                     "churn_score": 0.0,
                 },
                 "direction": direction,
+                "cross_repo_hops": [],
+                "unresolved_crossings": [],
             }
 
         if direction == "both":
@@ -2000,6 +2173,8 @@ class CodeFinder:
                     "churn_score": 0.0,
                 },
                 "direction": direction,
+                "cross_repo_hops": [],
+                "unresolved_crossings": [],
             }
 
         target_uids = [n["uid"] for n in target_nodes]
@@ -2007,29 +2182,19 @@ class CodeFinder:
         # 2. Change propagation query (upstream or downstream)
         propagation_query = _propagation_query(direction, depth)
 
-        paths = []
-        affected_nodes_map = {}
-        with self.driver.session() as session:
-            res_prop = session.run(propagation_query, target_uids=target_uids)
-            for row in res_prop:
-                p_nodes = []
-                for node_data in row["path_nodes"]:
-                    label_val = node_data.get("labels")
-                    node_type = (
-                        label_val[0]
-                        if isinstance(label_val, list)
-                        else str(label_val)
-                    )
-                    p_nodes.append({
-                        "uid": node_data["uid"],
-                        "name": node_data["name"],
-                        "path": node_data["path"],
-                        "type": node_type,
-                    })
-                p_rels = row["path_rels"]
+        paths: List[Dict[str, Any]] = []
+        affected_nodes_map: Dict[str, Dict[str, Any]] = {}
+
+        def _apply_propagation_rows(rows) -> List[str]:
+            """Shape raw propagation rows into paths/affected_nodes_map,
+            returning this batch's leaf-node uids (the next wire-bridging
+            frontier, when called again from a newly-crossed function)."""
+            leaf_uids: List[str] = []
+            for row in rows:
+                p_nodes = [_portable_node_fields(n) for n in row["path_nodes"]]
+                p_rels = [_portable_rel_fields(r) for r in row["path_rels"]]
                 paths.append({"nodes": p_nodes, "relationships": p_rels})
 
-                # Record affected nodes
                 for idx, node in enumerate(p_nodes[:-1]):
                     uid = node["uid"]
                     dist = len(p_nodes) - 1 - idx
@@ -2045,6 +2210,65 @@ class CodeFinder:
                         affected_nodes_map[uid]["depth"] = min(
                             affected_nodes_map[uid]["depth"], dist
                         )
+                if p_nodes:
+                    leaf_uids.append(p_nodes[-1]["uid"])
+            return leaf_uids
+
+        with self.driver.session() as session:
+            res_prop = session.run(propagation_query, target_uids=target_uids)
+            initial_leaf_uids = _apply_propagation_rows(res_prop)
+
+        # 2b. Downstream wire-bridging BFS (Task 7): cross PRODUCES_TO/
+        # CONSUMES_FROM (Pub/Sub) and SERVES/INVOKES (REST) wire edges into
+        # the repo(s) on the other side, then keep tracing the ordinary
+        # CALLS chain inside whatever function is found there. The frontier
+        # for the first wire-hop is the original target(s) themselves
+        # (a function can both call locally *and* publish directly) union
+        # the leaf nodes the in-repo propagation just reached. Upstream
+        # wire-bridging is Task 8's job, so this only runs downstream.
+        cross_repo_hops: List[Dict[str, Any]] = []
+        unresolved_crossings: List[Dict[str, Any]] = []
+        if direction == "downstream":
+            max_wire_hops = _sanitize_wire_hops(max_wire_hops)
+            visited_frontier_uids: set = set()
+            frontier = set(target_uids) | set(initial_leaf_uids)
+            with self.driver.session() as session:
+                for _ in range(max_wire_hops):
+                    frontier -= visited_frontier_uids
+                    if not frontier:
+                        break
+                    visited_frontier_uids |= frontier
+
+                    fragments, newly_discovered_uids, hop_unresolved = self._bridge_downstream(
+                        session, list(frontier)
+                    )
+                    unresolved_crossings.extend(hop_unresolved)
+                    if not newly_discovered_uids:
+                        break
+
+                    for fragment in fragments:
+                        cross_repo_hops.append({
+                            "topic": fragment.get("topic_name"),
+                            "subscription": fragment.get("subscription_name"),
+                            "from_uid": fragment.get("producer_uid"),
+                            "to_uid": fragment.get("consumer_uid"),
+                            "to_name": fragment.get("consumer_name"),
+                            "to_path": fragment.get("consumer_path"),
+                        })
+                        consumer_uid = fragment.get("consumer_uid")
+                        if consumer_uid and consumer_uid not in affected_nodes_map:
+                            affected_nodes_map[consumer_uid] = {
+                                "uid": consumer_uid,
+                                "name": fragment.get("consumer_name"),
+                                "type": "Function",
+                                "path": fragment.get("consumer_path"),
+                                "depth": 0,
+                            }
+
+                    res_hop = session.run(propagation_query, target_uids=newly_discovered_uids)
+                    hop_leaf_uids = _apply_propagation_rows(res_hop)
+
+                    frontier = set(newly_discovered_uids) | set(hop_leaf_uids)
 
         # 3. Calculate Scoring Metrics
         max_depth_seen = 0
@@ -2165,5 +2389,7 @@ class CodeFinder:
                 "churn_score": round(churn_score, 2),
             },
             "direction": direction,
+            "cross_repo_hops": cross_repo_hops,
+            "unresolved_crossings": unresolved_crossings,
         }
 

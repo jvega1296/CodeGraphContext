@@ -215,3 +215,40 @@ def test_channel_adapter_with_unresolved_subscription_placeholder_is_marked():
     beans, warnings = extract_channel_adapter_beans_from_source(source, Path("/r/ListenerConfig.java"), store=ConfigValueStore(repo_root="/r"))
     assert beans[0].confidence in ("AMBIGUOUS", "SYMBOLIC")
     assert "unresolved" in beans[0].provenance
+
+
+# ── Anti-goal: near-miss shapes warn, never silently vanish ─────────────────
+
+def test_service_activator_with_unrecognized_attribute_emits_warning_not_silence():
+    """`@ServiceActivator` is a 100%-confident consumer-wiring signal; a typo'd
+    or missing `inputChannel` attribute must warn, not silently disappear."""
+    source = """
+    @Service
+    public class ListenerService {
+        @ServiceActivator(channel = Constants.OMS_ORDER_EVENT_MESSAGE_CHANNEL)
+        public void onOrderCreateEvent(Message<String> message) { ... }
+    }
+    """
+    activators, warnings = extract_service_activators_from_source(source, Path("/r/ListenerService.java"))
+    assert activators == []
+    assert any("onOrderCreateEvent" in w and "ServiceActivator" in w for w in warnings)
+
+
+def test_channel_adapter_bean_missing_set_output_channel_emits_warning_not_silence():
+    """A @Bean method that constructs PubSubInboundChannelAdapter but never
+    calls setOutputChannel(...) must warn, not silently disappear."""
+    source = """
+    @Configuration
+    public class ListenerConfig {
+        @Value("${az.pubsub.subscription.name}")
+        private String subscriptionName;
+        @Bean
+        public PubSubInboundChannelAdapter adapter(PubSubTemplate t) {
+          PubSubInboundChannelAdapter a = new PubSubInboundChannelAdapter(t, subscriptionName);
+          return a;
+        }
+    }
+    """
+    beans, warnings = extract_channel_adapter_beans_from_source(source, Path("/r/ListenerConfig.java"))
+    assert beans == []
+    assert any("adapter" in w and "PubSubInboundChannelAdapter" in w for w in warnings)

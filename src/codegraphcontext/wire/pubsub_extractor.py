@@ -374,6 +374,13 @@ _SERVICE_ACTIVATOR_RE = re.compile(
     re.DOTALL,
 )
 
+# Presence-only check: `@ServiceActivator` is a 100%-confident "this is
+# consumer wiring" signal with no legitimate ambiguous case, so any method
+# carrying it that `_SERVICE_ACTIVATOR_RE` fails to fully match (different
+# attribute name/order, no `inputChannel` attribute at all, ...) must warn
+# rather than silently vanish — see the anti-goal in the implementation plan.
+_SERVICE_ACTIVATOR_PRESENCE_RE = re.compile(r"@ServiceActivator\b")
+
 
 def _find_matching_paren(text: str, open_pos: int) -> int:
     """Return the offset of the ``)`` that closes the ``(`` at ``open_pos``.
@@ -807,12 +814,28 @@ def extract_channel_adapter_beans_from_source(
             continue
         if decl.body_start is None or decl.body_end is None:
             continue
+        body = source[decl.body_start:decl.body_end]
         ctor = _find_adapter_construction(source, decl.body_start, decl.body_end)
-        if ctor is None:
-            continue
-        var_name, args = ctor
-        channel_ref = _find_set_output_channel(source, decl.body_start, decl.body_end, var_name)
-        if channel_ref is None:
+        channel_ref = None
+        if ctor is not None:
+            var_name, args = ctor
+            channel_ref = _find_set_output_channel(source, decl.body_start, decl.body_end, var_name)
+        if ctor is None or channel_ref is None:
+            # `PubSubInboundChannelAdapter` mentioned at all is a strong
+            # signal this @Bean is meant to be one of ours; failing to fully
+            # match the construct+setOutputChannel idiom must warn rather
+            # than vanish. A @Bean with no such mention is simply unrelated
+            # (most @Bean methods in a Spring config class are) and does not
+            # warn, to avoid flooding warnings for ordinary bean methods.
+            if "PubSubInboundChannelAdapter" in body:
+                near_miss_span = _enclosing_class(spans, decl.header_start)
+                label = _fqn(near_miss_span, decl.name) if near_miss_span else decl.name
+                warnings.append(
+                    f"{path}: {label} is a @Bean method mentioning "
+                    "PubSubInboundChannelAdapter but the `var = new "
+                    "PubSubInboundChannelAdapter(...); var.setOutputChannel(...)` "
+                    "shape was not fully recognized; this bean is not traced"
+                )
             continue
         span = _enclosing_class(spans, decl.header_start)
         if span is None:
@@ -864,15 +887,24 @@ def extract_service_activators_from_source(
         return f"{prefix}{span.name}.{method}"
 
     for decl in _iter_method_declarations(source):
-        m = _SERVICE_ACTIVATOR_RE.search(decl.annotations_text)
-        if m is None:
+        if not _SERVICE_ACTIVATOR_PRESENCE_RE.search(decl.annotations_text):
             continue
         span = _enclosing_class(spans, decl.header_start)
+        label = _fqn(span, decl.name) if span else decl.name
+        m = _SERVICE_ACTIVATOR_RE.search(decl.annotations_text)
+        if m is None:
+            warnings.append(
+                f"{path}: {label} is annotated @ServiceActivator but no "
+                "inputChannel=<value> attribute was recognized in it "
+                "(different attribute name/order, or missing entirely); "
+                "this method is not traced"
+            )
+            continue
         if span is None:
             continue
         raw = m.group(1).strip()
         activators.append(PubsubServiceActivator(
-            fqn=_fqn(span, decl.name),
+            fqn=label,
             input_channel_raw=raw,
             input_channel_resolved=_resolve_input_channel_literal(raw),
             source_file=path_str,

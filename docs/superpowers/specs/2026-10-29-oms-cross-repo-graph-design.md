@@ -1,6 +1,6 @@
 # OMS Cross-Repo Code + Infra Graph — Design
 
-Status: draft, pending approval — revised after independent builder-check (see Revision Log)
+Status: approved — all open items resolved (see Revision Log and Direction section)
 Date: 2026-10-29
 Author: Claude (Neo), with Javier Vega
 Fork: https://github.com/jvega1296/CodeGraphContext (local clone `C:\Users\jvega3\Documents\Personal\CodeGraphContext`, branch `main`, upstream PR #1728 already merged)
@@ -69,18 +69,16 @@ Two upstream PRs CGC already has (merged into this fork's `main`) looked like th
 5. **Security-keyword scoring, caller-count scoring, and churn scoring** (with its full caching/timeout/sticky-unavailable-cache/trailing-window infrastructure) are ported to **full fidelity** — none of these need new schema, so there's no reason to cut corners.
 6. **Line-level diff parsing, change-to-node mapping, and the diff-parsing robustness layer** (C-quoted paths, SVN support alongside Git, ref-injection-safety validation, graceful whole-file-scoring degradation with an explicit warning) are ported **in full** — pure Python, backend-agnostic, no reason to skip any of it.
 7. Development happens on the fork's `main` directly (already diverged from upstream; not intended to be upstreamed) — no need for worktree isolation to protect an upstream contribution flow. Worktrees may still be useful operationally for running independent pieces in parallel (builder's call).
-8. **Acceptance criterion, concrete and literal**: re-index `special-order-services`, `oms-order-consumer`, `oms-order-update-consumer`, and `terra-projects-oms/az-ordfl-ordrmgmt` for real (not mocked), then run the impact/blast-radius tool on `createOrder`/`MessagePublisher.publish` and confirm the result set includes nodes from the consumer repos *and* the Terraform module backing the topic — not just nodes inside `special-order-services`. This is "done," not "unit tests pass in isolation." **Caveat raised by builder-check**: `analyze_impact` as it exists today only traverses *upstream* (who calls into the target — classic blast radius for "what breaks if I change this"). Starting from the **producer** (`createOrder`) and expecting **consumers** in another repo to show up requires walking *outward/downstream* — the opposite direction. See Open Question below; this acceptance test's literal wording depends on its answer.
+8. **Acceptance criterion, concrete and literal**: re-index `special-order-services`, `oms-order-consumer`, `oms-order-update-consumer`, and `terra-projects-oms/az-ordfl-ordrmgmt` for real (not mocked), then run the impact/blast-radius tool on `createOrder`/`MessagePublisher.publish` and confirm the result set includes nodes from the consumer repos *and* the Terraform module backing the topic — not just nodes inside `special-order-services`. This is "done," not "unit tests pass in isolation." Run with `direction=both` (see Direction section) — the acceptance test is specifically a "complete picture" question, not a one-sided blast-radius question, so the merged-trace mode is the one that has to work for this to count as done.
 9. **Website UI diff from PR #1298 kept, not stripped** — it's a working enhancement to the already-working visualizer, no reason to remove it just because this project's primary interface is MCP tool calls, not the browser UI.
 
-## Open question — needs Javier's decision
+## Direction — resolved with Javier
 
-**Does `analyze_impact` gain a `direction` parameter, or does a separate tool handle downstream tracing?**
+**Decision: option (a), `direction: "upstream" | "downstream" | "both"` on `analyze_impact`, default `upstream`.**
 
-Why it matters: the existing traversal (`CALLS|INHERITS|...` walked backward from a target) answers "what calls into this." The acceptance test's framing — start at `createOrder`, find what it triggers downstream across repos — is the mirror-image question, and nothing in the current code does that walk. Options:
+Javier's framing, which fixes the exact semantics of `both`: changing a validation function in the middle of `createOrder` can break something *before* it in the flow (upstream — what feeds into/depends on this function's contract) *and* something *after* it (downstream — what this function's output drives, including across repos via Pub/Sub). Sometimes he only cares about one side (a narrower, faster review question); sometimes he wants the complete picture.
 
-- **(a) Add `direction: "upstream" | "downstream" | "both"` to `analyze_impact`** (default `upstream`, preserving today's behavior for existing callers) — one tool, one mental model, matches how `query_graph_tool`-style tools in code-review-graph expose `callers_of`/`callees_of` as a single parameterized concept. *Recommended*: smallest change, doesn't remove anything, directly satisfies the acceptance test by calling it with `direction=downstream` (or `both`) from the producer.
-- **(b) A separate, dedicated tool** (e.g. `trace_flow`) purely for forward/downstream tracing, leaving `analyze_impact` as pure "blast radius of changing this" (upstream only, matching its original documented intent and risk-scoring framing — a downstream trace isn't really a "risk of changing X" question, it's a "what does X cause" question, arguably a different enough concept to deserve its own name).
-- **(c) Reframe the acceptance test** to start from the *consumer* side instead (e.g. target the `@ServiceActivator` method in `oms-order-consumer`, trace upstream) — the existing upstream-only traversal, once extended with the Topic/Subscription bridging pattern, would find the producer this way without any direction-parameter work at all. Cheapest option, but doesn't give Javier the "trace `createOrder` forward" query he actually asked for by name.
+Implementation consequence this sets, beyond the parameter existing: **`direction=both` must return one connected trace** — true origin through the target to true termination, with the target point identifiable in the middle — not two independent, disconnected upstream/downstream result sets the caller has to mentally stitch back together. That merged-single-trace requirement is the part of this decision that actually constrains the implementation; the parameter itself is the easy part.
 
 ## What's left to the builder
 

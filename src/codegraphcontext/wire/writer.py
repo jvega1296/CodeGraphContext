@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from codegraphcontext.wire.grpc_scanner import GrpcScanResult
 from codegraphcontext.wire.http_scanner import HttpScanResult
 from codegraphcontext.wire.kafka_scanner import KafkaScanResult
+from codegraphcontext.wire.pubsub_scanner import PubsubScanResult
 
 
 HIGH_CONFIDENCE_TIERS = ("DECLARED", "EXTRACTED", "INFERRED", "NORMALIZED", "SYMBOLIC")
@@ -46,6 +47,9 @@ class WireWriteStats:
     invokes_edges: int = 0
     skipped_ambiguous: int = 0
     dropped_bad_fqn: int = 0
+    subscriptions_merged: int = 0
+    pubsub_produces_edges: int = 0
+    pubsub_consumes_edges: int = 0
 
 
 def _fqn_method_name(fqn: str) -> Optional[str]:
@@ -234,6 +238,80 @@ def _grpc_client_rows(scan: GrpcScanResult, include_ambiguous: bool) -> tuple:
     return list(ep_rows.values()), edge_rows, ambig, bad_fqn
 
 
+# Pub/Sub Subscription nodes have no Terraform data joined at this layer
+# (project_id isn't visible from application source at all), so every
+# pubsub-wire-derived Subscription row uses this same placeholder. Piece 3's
+# Terraform stitching step backfills the real project_id later; as long as
+# every row here is consistently "unknown", the (name, project_id) merge key
+# stays stable and doesn't fork into spurious duplicate nodes.
+_UNKNOWN_PROJECT_ID = "unknown"
+
+
+def _pubsub_producer_rows(scan: PubsubScanResult, include_ambiguous: bool) -> tuple:
+    """Return (topic_rows, function_edge_rows, dropped_ambiguous, dropped_bad_fqn).
+
+    Mirrors :func:`_kafka_producer_rows`, writing into the same ``Topic``
+    shape with ``system="pubsub"``. Pub/Sub publisher records always carry a
+    real enclosing-method FQN (no config-anchor case exists for publishers),
+    so there is no file-anchored variant here.
+    """
+    topic_rows: Dict[tuple, dict] = {}
+    edge_rows: List[dict] = []
+    ambig = 0; bad_fqn = 0
+    for p in scan.publishers:
+        if not _accept(p.confidence, include_ambiguous):
+            ambig += 1; continue
+        name = p.topic_resolved or p.topic_raw
+        key = ("pubsub", name)
+        topic_rows[key] = {"system": "pubsub", "name": name}
+        method = _fqn_method_name(p.fqn)
+        if method is None:
+            bad_fqn += 1; continue
+        edge_rows.append({
+            "system": "pubsub", "topic_name": name,
+            "path": p.source_file,
+            "method_name": method,
+            "match_confidence": p.confidence,
+            "provenance": p.provenance,
+            "call_shape": p.call_shape,
+            "call_line": p.line,
+            "topic_raw": p.topic_raw,
+        })
+    return list(topic_rows.values()), edge_rows, ambig, bad_fqn
+
+
+def _pubsub_consumer_rows(scan: PubsubScanResult, include_ambiguous: bool) -> tuple:
+    """Return (subscription_rows, function_edge_rows, dropped_ambiguous, dropped_bad_fqn).
+
+    Subscriber records carry no topic reference — the application code has
+    no way to know which topic a subscription is bound to, only its own
+    subscription name (see Decision #1: that join is Terraform's job, done
+    later in Piece 3). Subscriber FQNs are always a real ``@ServiceActivator``
+    method FQN, so there is no config-anchor case here either.
+    """
+    sub_rows: Dict[tuple, dict] = {}
+    edge_rows: List[dict] = []
+    ambig = 0; bad_fqn = 0
+    for s in scan.subscribers:
+        if not _accept(s.confidence, include_ambiguous):
+            ambig += 1; continue
+        key = (s.subscription_name, _UNKNOWN_PROJECT_ID)
+        sub_rows[key] = {"name": s.subscription_name, "project_id": _UNKNOWN_PROJECT_ID}
+        method = _fqn_method_name(s.fqn)
+        if method is None:
+            bad_fqn += 1; continue
+        edge_rows.append({
+            "subscription_name": s.subscription_name,
+            "project_id": _UNKNOWN_PROJECT_ID,
+            "path": s.source_file,
+            "method_name": method,
+            "match_confidence": s.confidence,
+            "provenance": s.provenance,
+            "call_line": s.line,
+        })
+    return list(sub_rows.values()), edge_rows, ambig, bad_fqn
+
+
 # ── Cypher ──────────────────────────────────────────────────────────────────
 
 _MERGE_TOPICS = """
@@ -320,6 +398,30 @@ SET e.match_confidence = row.match_confidence,
     e.source_file      = row.path
 """
 
+_MERGE_SUBSCRIPTIONS = """
+UNWIND $rows AS row
+MERGE (s:Subscription {name: row.name, project_id: row.project_id})
+"""
+
+# Not wired into write_wire_edges below — the application-code scan never
+# knows which Topic a Subscription is bound to (see Decision #1); this is
+# defined here for the Terraform stitching step (Piece 3) to call directly
+# once it has joined a Subscription to its real Topic.
+_MERGE_HAS_SUBSCRIPTION = """
+UNWIND $rows AS row
+MATCH (t:Topic {system: row.system, name: row.topic_name})
+MERGE (s:Subscription {name: row.subscription_name, project_id: row.project_id})
+MERGE (t)-[:HAS_SUBSCRIPTION]->(s)
+"""
+
+_MERGE_CONSUMES_FROM_SUBSCRIPTION = """
+UNWIND $rows AS row
+MATCH (fn:Function {path: row.path, name: row.method_name})
+MERGE (s:Subscription {name: row.subscription_name, project_id: row.project_id})
+MERGE (fn)-[e:CONSUMES_FROM {call_line: row.call_line}]->(s)
+SET e.match_confidence = row.match_confidence, e.provenance = row.provenance, e.source_file = row.path
+"""
+
 
 def write_wire_edges(
     writer: Any,
@@ -327,6 +429,7 @@ def write_wire_edges(
     kafka_scan: Optional[KafkaScanResult] = None,
     http_scan: Optional[HttpScanResult] = None,
     grpc_scan: Optional[GrpcScanResult] = None,
+    pubsub_scan: Optional[PubsubScanResult] = None,
     include_ambiguous: bool = False,
     batch_size: int = 500,
 ) -> WireWriteStats:
@@ -394,6 +497,21 @@ def write_wire_edges(
         stats.invokes_edges += len(c_edges)
         stats.skipped_ambiguous += s_amb + c_amb
         stats.dropped_bad_fqn += s_bad + c_bad
+
+    # Pub/Sub → Topic (producer) + Subscription (consumer)
+    if pubsub_scan is not None:
+        p_topics, p_edges, p_amb, p_bad = _pubsub_producer_rows(pubsub_scan, include_ambiguous)
+        s_subs, s_edges, s_amb, s_bad = _pubsub_consumer_rows(pubsub_scan, include_ambiguous)
+        _run(_MERGE_TOPICS, p_topics)
+        _run(_MERGE_PRODUCES_TO, p_edges)
+        _run(_MERGE_SUBSCRIPTIONS, s_subs)
+        _run(_MERGE_CONSUMES_FROM_SUBSCRIPTION, s_edges)
+        stats.topics_merged += len(p_topics)
+        stats.pubsub_produces_edges += len(p_edges)
+        stats.subscriptions_merged += len(s_subs)
+        stats.pubsub_consumes_edges += len(s_edges)
+        stats.skipped_ambiguous += p_amb + s_amb
+        stats.dropped_bad_fqn += p_bad + s_bad
 
     return stats
 

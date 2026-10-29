@@ -13,12 +13,15 @@ from codegraphcontext.wire import (
     HttpServerRecord,
     KafkaConsumerRecord,
     KafkaProducerRecord,
+    PubsubPublisherRecord,
+    PubsubSubscriberRecord,
     WireWriteStats,
     write_wire_edges,
 )
 from codegraphcontext.wire.grpc_scanner import GrpcScanResult
 from codegraphcontext.wire.http_scanner import HttpScanResult
 from codegraphcontext.wire.kafka_scanner import KafkaScanResult
+from codegraphcontext.wire.pubsub_scanner import PubsubScanResult
 
 
 # ── Test doubles ────────────────────────────────────────────────────────────
@@ -266,3 +269,21 @@ def test_producer_and_consumer_dedup_topic_merge():
     assert len(topic_calls) == 1
     assert len(topic_calls[0]["params"]["rows"]) == 1
     assert stats.topics_merged == 1
+
+
+def test_write_wire_edges_merges_subscription_node_and_edges():
+    writer = _FakeWriter()
+    pubsub_scan = PubsubScanResult(
+        publishers=[PubsubPublisherRecord(fqn="com.az.MessagePublisher.publish", topic_raw="oms-order-create-event",
+                                           topic_resolved="oms-order-create-event", confidence="EXTRACTED",
+                                           provenance="literal", source_file="/r/MessagePublisher.java", line=10,
+                                           call_shape="PubSubTemplate.publish")],
+        subscribers=[PubsubSubscriberRecord(fqn="com.az.ListenerService.onOrderCreateEvent",
+                                             subscription_name="oms-order-create-pull-subscription",
+                                             confidence="EXTRACTED", provenance="config:az.pubsub.subscription.name",
+                                             source_file="/r/ListenerService.java", line=20)],
+    )
+    stats = write_wire_edges(writer, pubsub_scan=pubsub_scan)
+    assert stats.subscriptions_merged == 1
+    assert stats.pubsub_produces_edges == 1
+    assert stats.pubsub_consumes_edges == 1

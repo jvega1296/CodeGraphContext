@@ -771,9 +771,124 @@ def extract_publishers_from_source(
     return result
 
 
+def extract_channel_adapter_beans_from_source(
+    source: str,
+    path: Path,
+    *,
+    store: Optional[ConfigValueStore] = None,
+    active_profile: str = BASE_PROFILE,
+) -> Tuple[List[PubsubChannelAdapterBean], List[str]]:
+    """Extract ``@Bean``-declared ``PubSubInboundChannelAdapter`` beans.
+
+    Recognises a method annotated ``@Bean`` whose body constructs
+    ``new PubSubInboundChannelAdapter(<template>, <subscription>)`` and then
+    calls ``.setOutputChannel(<channel>)`` on the resulting local variable.
+    Per-file and side-effect-free; this does not attempt the cross-file join
+    to a ``@ServiceActivator`` (that is Task 3's job, in ``pubsub_scanner.py``).
+    """
+    beans: List[PubsubChannelAdapterBean] = []
+    warnings: List[str] = []
+    path_str = str(path)
+
+    pkg = _extract_package(source)
+    spans = _extract_class_spans(source)
+    if not spans:
+        warnings.append(f"{path}: no top-level class/interface found; skipping")
+        return beans, warnings
+
+    def _fqn(span: _ClassSpan, method: str) -> str:
+        prefix = f"{pkg}." if pkg else ""
+        return f"{prefix}{span.name}.{method}"
+
+    value_fields_cache: dict = {}
+
+    for decl in _iter_method_declarations(source):
+        if not re.search(r"@Bean\b", decl.annotations_text):
+            continue
+        if decl.body_start is None or decl.body_end is None:
+            continue
+        ctor = _find_adapter_construction(source, decl.body_start, decl.body_end)
+        if ctor is None:
+            continue
+        var_name, args = ctor
+        channel_ref = _find_set_output_channel(source, decl.body_start, decl.body_end, var_name)
+        if channel_ref is None:
+            continue
+        span = _enclosing_class(spans, decl.header_start)
+        if span is None:
+            continue
+        value_fields = value_fields_cache.setdefault(
+            id(span), _value_fields_in_class(source, span)
+        )
+        sub_raw, sub_resolved, tier, prov = _classify_subscription(
+            args[1], store, active_profile, value_fields
+        )
+        qualifier = _qualifier_for_param(decl.params_text, channel_ref)
+        beans.append(PubsubChannelAdapterBean(
+            fqn=_fqn(span, decl.name),
+            subscription_raw=sub_raw,
+            subscription_resolved=sub_resolved,
+            confidence=tier,
+            provenance=prov,
+            output_channel_ref=channel_ref,
+            output_channel_qualifier=qualifier,
+            source_file=path_str,
+            line=_offset_to_line(source, decl.header_start),
+        ))
+
+    return beans, warnings
+
+
+def extract_service_activators_from_source(
+    source: str,
+    path: Path,
+) -> Tuple[List[PubsubServiceActivator], List[str]]:
+    """Extract ``@ServiceActivator(inputChannel = <value>)`` methods.
+
+    ``<value>`` is captured verbatim from source (string literal with quotes,
+    or a dotted ``Constants.X``-style reference) — see the Task 2 grounding
+    correction for why both forms must be preserved without normalization.
+    """
+    activators: List[PubsubServiceActivator] = []
+    warnings: List[str] = []
+    path_str = str(path)
+
+    pkg = _extract_package(source)
+    spans = _extract_class_spans(source)
+    if not spans:
+        warnings.append(f"{path}: no top-level class/interface found; skipping")
+        return activators, warnings
+
+    def _fqn(span: _ClassSpan, method: str) -> str:
+        prefix = f"{pkg}." if pkg else ""
+        return f"{prefix}{span.name}.{method}"
+
+    for decl in _iter_method_declarations(source):
+        m = _SERVICE_ACTIVATOR_RE.search(decl.annotations_text)
+        if m is None:
+            continue
+        span = _enclosing_class(spans, decl.header_start)
+        if span is None:
+            continue
+        raw = m.group(1).strip()
+        activators.append(PubsubServiceActivator(
+            fqn=_fqn(span, decl.name),
+            input_channel_raw=raw,
+            input_channel_resolved=_resolve_input_channel_literal(raw),
+            source_file=path_str,
+            line=_offset_to_line(source, decl.header_start),
+        ))
+
+    return activators, warnings
+
+
 __all__ = [
+    "PubsubChannelAdapterBean",
     "PubsubExtractionResult",
     "PubsubPublisherRecord",
+    "PubsubServiceActivator",
+    "extract_channel_adapter_beans_from_source",
     "extract_publishers_from_source",
+    "extract_service_activators_from_source",
     "looks_like_pubsub_source",
 ]

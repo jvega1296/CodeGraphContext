@@ -1,5 +1,12 @@
 from typing import Any, Dict, List, Optional
-from codegraphcontext.tools.code_finder import CodeFinder
+
+import pytest
+
+from codegraphcontext.tools.code_finder import (
+    CodeFinder,
+    _portable_node_fields,
+    _portable_rel_fields,
+)
 
 class _FakeResult:
     def __init__(self, data_list: List[Dict[str, Any]]):
@@ -188,6 +195,9 @@ def test_analyze_impact_downstream_direction_reverses_query_arrow():
     assert len(res["propagation_paths"]) == 1
     # the canned downstream fixture row proves the reversed-arrow query ran
     assert res["propagation_paths"][0]["nodes"][-1]["name"] == "validateOrder"
+    # exercises the downstream (outgoing-edge) _criticality_query fixture
+    # branch, previously wired but never asserted on (count=3 -> 3*0.2=0.6)
+    assert res["risk_breakdown"]["criticality_score"] == 0.6
 
 def test_analyze_impact_downstream_crosses_pubsub_topic_to_consumer_repo():
     finder, recorder = _make_finder()
@@ -200,3 +210,31 @@ def test_downstream_trace_reports_unresolved_crossing_for_dead_end_topic():
     finder, recorder = _make_finder()
     res = finder.analyze_impact(target="publishInventoryAudit", direction="downstream")
     assert any(c["topic"] == "order-inv-inquiry-oms-leg-analysis-event" for c in res["unresolved_crossings"])
+
+@pytest.mark.parametrize("backend", ["neo4j", "falkordb"])
+def test_portable_field_helpers_handle_real_driver_objects(backend):
+    """_portable_node_fields/_portable_rel_fields must work on the actual
+    objects each backend's driver returns, not just a plain dict -- a bug
+    that unit tests built only on the FakeSession's raw-dict fixtures would
+    never catch. Mirrors test_class_call_queries.py's
+    test_path_conversion_preserves_driver_relationship_properties, which is
+    what proves the duck-typed (no isinstance-guard) style these helpers
+    copy actually works for these two backends."""
+    if backend == "neo4j":
+        from neo4j.graph import Graph, Node
+
+        graph = Graph()
+        node = Node(graph, "n0", 0, ["Function"], {"uid": "func_entry", "name": "entry", "path": "/repo/app.py"})
+        rel = graph.relationship_type("CALLS")(graph, "r0", 0, {"line_number": 7})
+    else:
+        from falkordb.node import Node
+        from falkordb.edge import Edge
+
+        node = Node(node_id=0, labels=["Function"], properties={"uid": "func_entry", "name": "entry", "path": "/repo/app.py"})
+        other = Node(node_id=1, labels=["Function"], properties={"name": "build"})
+        rel = Edge(node, "CALLS", other, properties={"line_number": 7})
+
+    assert _portable_node_fields(node) == {
+        "uid": "func_entry", "name": "entry", "path": "/repo/app.py", "type": "Function",
+    }
+    assert _portable_rel_fields(rel) == {"type": "CALLS", "line_number": 7}

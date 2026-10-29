@@ -148,20 +148,34 @@ def _propagation_query(direction: str, depth: int) -> str:
 def _portable_node_fields(node: Any) -> Dict[str, Any]:
     """Extract uid/name/path/type from one element of ``nodes(p)``.
 
-    Neo4j-driver Node objects expose ``.properties``/``.labels``. LadybugDB
-    and KùzuDB instead return a plain dict with the label spelled flat on the
-    row under ``_LABEL``/``_label`` (see ``viz/server.py``'s ``_meta()`` for
-    the same cross-backend casing distinction, confirmed against a live
-    query on each embedded backend).
+    Pure duck-typed field access, deliberately with no ``isinstance(props,
+    dict)`` guard -- ``_call_path_edges`` below already proves this is both
+    necessary and sufficient (see its parametrized
+    ``test_path_conversion_preserves_driver_relationship_properties`` in
+    ``tests/unit/tools/test_class_call_queries.py``, covering real
+    ``neo4j``/``falkordb`` driver objects). Real ``neo4j.graph`` ``Node``/
+    ``Relationship`` objects have *no* public ``.properties`` attribute --
+    only a private ``_properties`` -- but they subclass ``Mapping`` and
+    implement ``.get()`` themselves, so ``getattr(node, "properties",
+    node).get(...)`` correctly falls through to calling ``.get()`` on the
+    node object itself. Adding an ``isinstance(props, dict)`` check here
+    would discard that working object and silently replace it with ``{}``,
+    which is exactly the regression this docstring warns against.
+
+    FalkorDB's ``falkordb.node.Node`` does have a real ``.properties`` dict
+    and ``.labels`` list, so this also works unchanged there. LadybugDB and
+    KùzuDB instead return a plain dict per node, with the label spelled flat
+    on it under ``_LABEL``/``_label`` (see ``viz/server.py``'s ``_meta()``
+    for the same cross-backend casing distinction, confirmed against a live
+    query on each embedded backend; ``_label`` checked first there, mirrored
+    here for consistency).
     """
     props = getattr(node, "properties", node)
-    if not isinstance(props, dict):
-        props = {}
     labels = getattr(node, "labels", None)
     if labels:
         node_type = next(iter(labels))
     else:
-        node_type = props.get("_LABEL") or props.get("_label") or "Unknown"
+        node_type = props.get("_label") or props.get("_LABEL") or "Unknown"
     return {
         "uid": props.get("uid"),
         "name": props.get("name"),
@@ -172,12 +186,23 @@ def _portable_node_fields(node: Any) -> Dict[str, Any]:
 
 def _portable_rel_fields(rel: Any) -> Dict[str, Any]:
     """Extract type/line_number from one element of ``relationships(p)``,
-    mirroring ``_portable_node_fields``'s Neo4j-vs-LadybugDB/KùzuDB handling.
+    mirroring ``_portable_node_fields``'s no-isinstance-guard duck typing.
+
+    Relationship type needs a three-way fallback, one per backend: Neo4j's
+    ``Relationship.type`` (always a non-empty string -- it is literally
+    ``type(self).__name__`` on the driver's dynamically-created subclass);
+    FalkorDB's ``falkordb.edge.Edge.relation`` (it has no ``.type`` at all);
+    LadybugDB/KùzuDB's flat dict ``_label``/``_LABEL`` key (no ``.type`` or
+    ``.relation`` attribute at all -- it's a plain dict).
     """
     props = getattr(rel, "properties", rel)
-    if not isinstance(props, dict):
-        props = {}
-    rel_type = getattr(rel, "type", None) or props.get("_LABEL") or props.get("_label") or "UNKNOWN"
+    rel_type = (
+        getattr(rel, "type", None)
+        or getattr(rel, "relation", None)
+        or props.get("_label")
+        or props.get("_LABEL")
+        or "UNKNOWN"
+    )
     return {"type": rel_type, "line_number": props.get("line_number") or 0}
 
 
@@ -2257,6 +2282,15 @@ class CodeFinder:
                         })
                         consumer_uid = fragment.get("consumer_uid")
                         if consumer_uid and consumer_uid not in affected_nodes_map:
+                            # depth resets to 0 at the wire crossing rather than
+                            # accumulating distance from the original target --
+                            # there is no single meaningful "hop count" across a
+                            # repo boundary that mixes in-repo CALLS-chain depth
+                            # with cross-repo wire hops. This is a deliberate
+                            # choice, not an oversight: Task 9/16's risk-scoring
+                            # work should treat cross-repo depth as its own axis
+                            # (e.g. cross_repo_hops length) rather than reading
+                            # affected_nodes depth as a single unified distance.
                             affected_nodes_map[consumer_uid] = {
                                 "uid": consumer_uid,
                                 "name": fragment.get("consumer_name"),

@@ -5,7 +5,9 @@ from pathlib import Path
 
 from codegraphcontext.wire.config_values import ConfigValueStore
 from codegraphcontext.wire.pubsub_extractor import (
+    extract_channel_adapter_beans_from_source,
     extract_publishers_from_source,
+    extract_service_activators_from_source,
     looks_like_pubsub_source,
 )
 
@@ -91,3 +93,30 @@ def test_raw_publisher_field_named_with_pubsub_is_not_misclassified():
     result = extract_publishers_from_source(source, Path("/r/RawNamedPublisher.java"))
     assert result.publishers == []
     assert any("raw" in w.lower() or "unrecognized" in w.lower() or "Publisher" in w for w in result.warnings)
+
+
+# ── Consumer extraction: channel-adapter bean ───────────────────────────────
+
+def test_extracts_channel_adapter_bean_with_property_subscription_and_qualifier():
+    source = """
+    @Configuration
+    public class ListenerConfig {
+        @Value("${az.pubsub.subscription.name}")
+        private String subscriptionName;
+
+        @Bean
+        public PubSubInboundChannelAdapter messageChannelAdapter(
+            @Qualifier(Constants.OMS_ORDER_EVENT_MESSAGE_CHANNEL) MessageChannel omsOrderEventChannel,
+            PubSubTemplate pubSubTemplate) {
+          PubSubInboundChannelAdapter adapter = new PubSubInboundChannelAdapter(pubSubTemplate, subscriptionName);
+          adapter.setOutputChannel(omsOrderEventChannel);
+          return adapter;
+        }
+    }
+    """
+    beans, warnings = extract_channel_adapter_beans_from_source(source, Path("/r/ListenerConfig.java"))
+    assert len(beans) == 1
+    bean = beans[0]
+    assert bean.subscription_raw == "subscriptionName"
+    assert bean.output_channel_ref == "omsOrderEventChannel"
+    assert bean.output_channel_qualifier == "Constants.OMS_ORDER_EVENT_MESSAGE_CHANNEL"

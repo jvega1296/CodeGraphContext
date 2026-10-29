@@ -6,9 +6,13 @@ method. A downstream writer (added in a later PR, gated on
 ``MULTI_REPO_LINKS=true``) will turn these records into ``PRODUCES_TO``
 edges between ``Function`` and ``Topic`` nodes.
 
-This is the producer-side half of the Pub/Sub extractor; a later PR
-extends this same module with the consumer-side (bean /
-``@ServiceActivator``-style) extraction.
+This module also contains the consumer-side half: extraction of Spring
+Cloud GCP ``@Bean``-declared ``PubSubInboundChannelAdapter`` beans and the
+``@ServiceActivator`` methods that consume their output channel. The two
+sides are extracted independently and per-file; joining a bean's
+``output_channel_qualifier`` to an activator's ``input_channel_raw``
+(same-file or cross-file) is the cross-file scanner's job, not this
+module's.
 
 Like :mod:`codegraphcontext.wire.kafka_extractor`, the extractor is
 deliberately regex- + brace-tracking-based rather than tree-sitter-driven,
@@ -64,6 +68,28 @@ class PubsubExtractionResult:
 
     def is_empty(self) -> bool:
         return not self.publishers
+
+
+@dataclass(frozen=True)
+class PubsubChannelAdapterBean:
+    fqn: str                      # bean method FQN
+    subscription_raw: str         # second ctor arg's identifier, verbatim (or unquoted literal)
+    subscription_resolved: str    # after ConfigValueStore resolution (== raw if literal / unresolved)
+    confidence: str                # EXTRACTED | INFERRED | SYMBOLIC | AMBIGUOUS
+    provenance: str
+    output_channel_ref: str       # variable name passed to setOutputChannel(...)
+    output_channel_qualifier: Optional[str]  # raw @Qualifier(...) text on that parameter, verbatim (quotes kept), if present
+    source_file: str
+    line: int                     # 1-based
+
+
+@dataclass(frozen=True)
+class PubsubServiceActivator:
+    fqn: str                      # method FQN
+    input_channel_raw: str        # raw inputChannel = ... text, verbatim (quotes kept if a string literal)
+    input_channel_resolved: Optional[str]  # unquoted literal value, or None for a symbolic/constant reference
+    source_file: str
+    line: int
 
 
 # ── Trigger detection ───────────────────────────────────────────────────────
@@ -293,6 +319,278 @@ def _is_pubsub_template_receiver(ident: str, fields: set) -> bool:
     if ident in fields:
         return True
     return "pubsubtemplate" in ident.lower()
+
+
+# ── Consumer-side structural helpers ────────────────────────────────────────
+
+# `@Value("${...}")`-annotated `String` field declaration — used to resolve a
+# channel-adapter bean's subscription-name identifier back to its placeholder,
+# the one case Task 1's `_string_constants_in_class` (plain `String X = "lit";`)
+# does not cover.
+_VALUE_FIELD_RE = re.compile(
+    r'@Value\s*\(\s*"([^"]*)"\s*\)\s*'
+    r'(?:(?:public|private|protected|static|final)\s+)*'
+    r'String\s+([A-Za-z_]\w*)\s*;'
+)
+
+# Method declaration up to and including the opening `(` of its parameter
+# list. Group 1 captures every annotation preceding the method (so callers
+# can grep it for `@Bean` / `@ServiceActivator`); group 2 is the method name.
+# The parameter list itself is located afterwards via `_find_matching_paren`
+# so nested parens in parameter annotations (e.g. `@Qualifier(Constants.X)`)
+# are handled correctly instead of truncating on the first `)`.
+_METHOD_START_RE = re.compile(
+    r"""
+    ((?:@[\w.]+\s*(?:\([^)]*\))?\s*)*)
+    (?:(?:public|private|protected|static|final|synchronized|abstract|default|native)\s+)*
+    (?:<[^>]+>\s*)?
+    [\w.<>?,\s\[\]]+?\s+
+    ([A-Za-z_]\w*)
+    \s*\(
+    """,
+    re.VERBOSE,
+)
+
+# Whatever follows a method's `)` before its body: an optional `throws`
+# clause, then either `{` (has a body) or `;` (abstract/interface method,
+# no body to search for a constructor call in).
+_AFTER_PARAMS_RE = re.compile(
+    r"\s*(?:throws\s+[\w.,\s<>\[\]]+?)?\s*([{;])"
+)
+
+# `<var> = new PubSubInboundChannelAdapter(` — the local variable that a
+# `@Bean` method assigns the adapter to; `.setOutputChannel(...)` is then
+# looked up on that same variable name within the rest of the method body.
+_ADAPTER_CTOR_RE = re.compile(
+    r"([A-Za-z_]\w*)\s*=\s*new\s+PubSubInboundChannelAdapter\s*\("
+)
+
+# `@ServiceActivator(inputChannel = <value>)` — `<value>` is captured
+# verbatim (quotes kept if it is a string literal, dotted form kept as-is
+# if it is a `Constants.X`-style reference); see the Task 2 grounding
+# correction for why both forms are real and neither is normalized here.
+_SERVICE_ACTIVATOR_RE = re.compile(
+    r"@ServiceActivator\s*\(\s*inputChannel\s*=\s*(.*?)\s*\)",
+    re.DOTALL,
+)
+
+
+def _find_matching_paren(text: str, open_pos: int) -> int:
+    """Return the offset of the ``)`` that closes the ``(`` at ``open_pos``.
+
+    Mirrors :func:`_find_matching_brace` but for parens; handles nested
+    parens and ``"strings"`` inside the call/parameter-list text.
+    """
+    depth = 0
+    i = open_pos
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _split_top_level_args(text: str) -> List[str]:
+    """Split ``text`` on top-level commas, respecting ``()``, ``<>``, and
+    ``"strings"``. Used for both call-argument lists and parameter lists."""
+    parts: List[str] = []
+    depth_paren = 0
+    depth_angle = 0
+    start = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "(":
+            depth_paren += 1
+        elif c == ")":
+            if depth_paren > 0:
+                depth_paren -= 1
+        elif c == "<":
+            depth_angle += 1
+        elif c == ">":
+            if depth_angle > 0:
+                depth_angle -= 1
+        elif c == "," and depth_paren == 0 and depth_angle == 0:
+            parts.append(text[start:i].strip())
+            start = i + 1
+        i += 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+@dataclass
+class _MethodDecl:
+    name: str
+    annotations_text: str
+    header_start: int             # offset where the declaration (first annotation/modifier) starts
+    params_text: str
+    body_start: Optional[int]     # offset of the method's `{`, or None (abstract/interface method)
+    body_end: Optional[int]       # offset of the matching `}`, or None
+
+
+def _iter_method_declarations(source: str) -> List[_MethodDecl]:
+    """Find every method declaration in ``source`` (whole-file scan).
+
+    Mirrors the producer extractor's whole-file-scan-then-locate-enclosing-class
+    pattern (see ``_PUBLISH_CALL_RE.finditer(source)`` + ``_enclosing_class``)
+    rather than scanning per-class-span, so a method is reported exactly once
+    even if its class is nested inside another class span.
+    """
+    decls: List[_MethodDecl] = []
+    for m in _METHOD_START_RE.finditer(source):
+        annotations_text = m.group(1)
+        name = m.group(2)
+        open_paren = m.end() - 1
+        close_paren = _find_matching_paren(source, open_paren)
+        if close_paren == -1:
+            continue
+        params_text = source[open_paren + 1:close_paren]
+        after = _AFTER_PARAMS_RE.match(source, close_paren + 1)
+        body_start: Optional[int] = None
+        body_end: Optional[int] = None
+        if after is not None and after.group(1) == "{":
+            brace = after.start(1)
+            close_brace = _find_matching_brace(source, brace)
+            if close_brace != -1:
+                body_start, body_end = brace, close_brace
+        decls.append(_MethodDecl(
+            name=name,
+            annotations_text=annotations_text,
+            header_start=m.start(),
+            params_text=params_text,
+            body_start=body_start,
+            body_end=body_end,
+        ))
+    return decls
+
+
+def _value_fields_in_class(source: str, class_span: _ClassSpan) -> dict:
+    """Return a ``{IDENTIFIER: placeholder}`` map of ``@Value("${...}")``
+    annotated ``String`` field declarations inside the class."""
+    body = source[class_span.start_offset:class_span.end_offset]
+    result: dict = {}
+    for m in _VALUE_FIELD_RE.finditer(body):
+        result[m.group(2)] = m.group(1)
+    return result
+
+
+def _find_adapter_construction(
+    source: str, body_start: int, body_end: int
+) -> Optional[Tuple[str, List[str]]]:
+    """Find ``<var> = new PubSubInboundChannelAdapter(<args>)`` in a method body.
+
+    Returns ``(var_name, args)`` or ``None`` if the shape is not present or
+    has fewer than two constructor arguments.
+    """
+    m = _ADAPTER_CTOR_RE.search(source, body_start, body_end)
+    if m is None:
+        return None
+    var_name = m.group(1)
+    open_paren = m.end() - 1
+    close_paren = _find_matching_paren(source, open_paren)
+    if close_paren == -1 or close_paren > body_end:
+        return None
+    args = _split_top_level_args(source[open_paren + 1:close_paren])
+    if len(args) < 2:
+        return None
+    return var_name, args
+
+
+def _find_set_output_channel(
+    source: str, body_start: int, body_end: int, var_name: str
+) -> Optional[str]:
+    """Find ``<var_name>.setOutputChannel(<arg>)`` in a method body and
+    return ``<arg>``'s raw text, or ``None`` if not present."""
+    call_re = re.compile(r"\b" + re.escape(var_name) + r"\s*\.\s*setOutputChannel\s*\(")
+    m = call_re.search(source, body_start, body_end)
+    if m is None:
+        return None
+    return _read_first_call_arg(source, m.end() - 1)
+
+
+def _qualifier_for_param(params_text: str, param_name: str) -> Optional[str]:
+    """Return the raw ``@Qualifier(...)`` text (verbatim, quotes kept) for
+    the parameter named ``param_name``, or ``None`` if that parameter has
+    no ``@Qualifier`` annotation (or is not found in ``params_text`` at
+    all — e.g. the ``setOutputChannel`` argument was not one of the bean
+    method's own parameters)."""
+    for part in _split_top_level_args(params_text):
+        m_name = re.search(r"([A-Za-z_]\w*)\s*$", part)
+        if not m_name or m_name.group(1) != param_name:
+            continue
+        m_q = re.search(r"@Qualifier\s*\(\s*(.*?)\s*\)", part, re.DOTALL)
+        return m_q.group(1) if m_q else None
+    return None
+
+
+def _resolve_input_channel_literal(raw: str) -> Optional[str]:
+    """Unquote ``raw`` if it is a string literal; ``None`` for a symbolic
+    reference (e.g. ``Constants.X``), which this module cannot resolve
+    without seeing the ``Constants`` class — that join is Task 3's job."""
+    m = _STRING_LITERAL_RE.match(raw)
+    return m.group(1) if m else None
+
+
+def _classify_subscription(
+    arg_text: str,
+    store: Optional[ConfigValueStore],
+    active_profile: str,
+    value_fields: dict,
+) -> Tuple[str, str, str, str]:
+    """Classify a channel-adapter bean's second constructor argument.
+
+    Returns ``(subscription_raw, subscription_resolved, confidence, provenance)``.
+    ``subscription_raw`` is always the argument's own text (the identifier,
+    or the unquoted literal) — unlike the producer's ``topic_raw``, it is
+    never replaced by an underlying constant's value, per the Task 2 brief.
+    """
+    text = arg_text.strip()
+
+    m = _STRING_LITERAL_RE.match(text)
+    if m:
+        literal = m.group(1)
+        _, resolved, tier, prov = _classify_literal(literal, store, active_profile)
+        return literal, resolved, tier, prov
+
+    if re.fullmatch(r"[A-Za-z_]\w*", text):
+        placeholder = value_fields.get(text)
+        if placeholder is not None:
+            _, resolved, tier, prov = _classify_literal(placeholder, store, active_profile)
+            return text, resolved, tier, f"identifier:{text}→{prov}"
+        return text, text, "SYMBOLIC", f"unresolved:identifier:{text}"
+
+    return text, text, "AMBIGUOUS", "expression"
 
 
 # ── Value parsing (literal / placeholder / identifier) ─────────────────────

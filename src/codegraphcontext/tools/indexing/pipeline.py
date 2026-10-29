@@ -511,6 +511,7 @@ async def run_tree_sitter_index_async(
                 scan_repo_grpc,
                 scan_repo_http,
                 scan_repo_kafka,
+                scan_repo_pubsub,
                 write_wire_edges,
             )
             repo_root = path.resolve()
@@ -523,26 +524,32 @@ async def run_tree_sitter_index_async(
             kafka_scan = scan_repo_kafka(repo_root, store=store)
             http_scan = scan_repo_http(repo_root, store=store)
             grpc_scan = scan_repo_grpc(repo_root, store=store)
+            pubsub_scan = scan_repo_pubsub(repo_root, store=store)
             warning_logger(
                 f"[WIRE] Scan complete — "
                 f"kafka p/c={len(kafka_scan.producers)}/{len(kafka_scan.consumers)} "
                 f"http s/c={len(http_scan.servers)}/{len(http_scan.clients)} "
-                f"grpc s/c={len(grpc_scan.servers)}/{len(grpc_scan.clients)}"
+                f"grpc s/c={len(grpc_scan.servers)}/{len(grpc_scan.clients)} "
+                f"pubsub p/s={len(pubsub_scan.publishers)}/{len(pubsub_scan.subscribers)}"
             )
             wire_stats = write_wire_edges(
                 writer,
                 kafka_scan=kafka_scan,
                 http_scan=http_scan,
                 grpc_scan=grpc_scan,
+                pubsub_scan=pubsub_scan,
                 include_ambiguous=include_ambiguous,
             )
             warning_logger(
                 f"[WIRE] Persist complete — topics={wire_stats.topics_merged} "
                 f"endpoints={wire_stats.endpoints_merged} "
+                f"subscriptions={wire_stats.subscriptions_merged} "
                 f"PRODUCES_TO={wire_stats.produces_edges} "
                 f"CONSUMES_FROM={wire_stats.consumes_edges} "
                 f"SERVES={wire_stats.serves_edges} "
                 f"INVOKES={wire_stats.invokes_edges} "
+                f"pubsub_produces_edges={wire_stats.pubsub_produces_edges} "
+                f"pubsub_consumes_edges={wire_stats.pubsub_consumes_edges} "
                 f"skipped_ambiguous={wire_stats.skipped_ambiguous} "
                 f"dropped_bad_fqn={wire_stats.dropped_bad_fqn}"
             )

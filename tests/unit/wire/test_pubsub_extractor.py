@@ -120,3 +120,98 @@ def test_extracts_channel_adapter_bean_with_property_subscription_and_qualifier(
     assert bean.subscription_raw == "subscriptionName"
     assert bean.output_channel_ref == "omsOrderEventChannel"
     assert bean.output_channel_qualifier == "Constants.OMS_ORDER_EVENT_MESSAGE_CHANNEL"
+
+
+def test_extracts_channel_adapter_bean_with_string_literal_qualifier():
+    """Grounding correction form 2 (3 repos): @Qualifier("...") bare string
+    literal, verbatim including quotes — not just the Constants.X form."""
+    source = """
+    @Configuration
+    public class MessageReceiver {
+        @Value("${az.pubsub.subscription.name}")
+        private String subscriptionName;
+
+        @Bean
+        public PubSubInboundChannelAdapter messageChannelAdapter(
+            @Qualifier("inputMessageChannel") MessageChannel inputMessageChannel,
+            PubSubTemplate pubSubTemplate) {
+          PubSubInboundChannelAdapter adapter = new PubSubInboundChannelAdapter(pubSubTemplate, subscriptionName);
+          adapter.setOutputChannel(inputMessageChannel);
+          return adapter;
+        }
+    }
+    """
+    beans, warnings = extract_channel_adapter_beans_from_source(source, Path("/r/MessageReceiver.java"))
+    assert len(beans) == 1
+    bean = beans[0]
+    assert bean.output_channel_ref == "inputMessageChannel"
+    assert bean.output_channel_qualifier == '"inputMessageChannel"'
+
+
+# ── Consumer extraction: @ServiceActivator ──────────────────────────────────
+
+def test_extracts_service_activator_with_input_channel():
+    source = """
+    @Service
+    public class ListenerService {
+        @ServiceActivator(inputChannel = Constants.OMS_ORDER_EVENT_MESSAGE_CHANNEL)
+        public void onOrderCreateEvent(Message<String> message) { ... }
+    }
+    """
+    activators, warnings = extract_service_activators_from_source(source, Path("/r/ListenerService.java"))
+    assert len(activators) == 1
+    assert activators[0].input_channel_raw == "Constants.OMS_ORDER_EVENT_MESSAGE_CHANNEL"
+    assert activators[0].fqn.endswith("ListenerService.onOrderCreateEvent")
+
+
+def test_service_activator_with_symbolic_input_channel_is_not_locally_resolved():
+    """A `Constants.X` reference cannot be resolved from this file alone (the
+    Constants class may live elsewhere) — resolving it is Task 3's join."""
+    source = """
+    @Service
+    public class ListenerService {
+        @ServiceActivator(inputChannel = Constants.OMS_ORDER_EVENT_MESSAGE_CHANNEL)
+        public void onOrderCreateEvent(Message<String> message) { ... }
+    }
+    """
+    activators, warnings = extract_service_activators_from_source(source, Path("/r/ListenerService.java"))
+    assert activators[0].input_channel_resolved is None
+
+
+def test_extracts_service_activator_with_string_literal_input_channel():
+    """Grounding correction form 2 (3 repos): inputChannel = "..." bare string
+    literal, verbatim including quotes — not just the Constants.X form."""
+    source = """
+    @Component
+    public class MessageReceiver {
+        @ServiceActivator(inputChannel = "inputMessageChannel")
+        public void onMessage(Message<String> message) { ... }
+    }
+    """
+    activators, warnings = extract_service_activators_from_source(source, Path("/r/MessageReceiver.java"))
+    assert len(activators) == 1
+    assert activators[0].input_channel_raw == '"inputMessageChannel"'
+    assert activators[0].input_channel_resolved == "inputMessageChannel"
+    assert activators[0].fqn.endswith("MessageReceiver.onMessage")
+
+
+# ── Consumer extraction: unresolved subscription placeholder ───────────────
+
+def test_channel_adapter_with_unresolved_subscription_placeholder_is_marked():
+    source = """
+    @Configuration
+    public class ListenerConfig {
+        @Value("${az.pubsub.subscription.name}")
+        private String subscriptionName;
+        @Bean
+        public PubSubInboundChannelAdapter adapter(PubSubTemplate t) {
+          PubSubInboundChannelAdapter a = new PubSubInboundChannelAdapter(t, subscriptionName);
+          a.setOutputChannel(someChannel);
+          return a;
+        }
+    }
+    """
+    # No ConfigValueStore entry for az.pubsub.subscription.name
+    beans, warnings = extract_channel_adapter_beans_from_source(source, Path("/r/ListenerConfig.java"), store=ConfigValueStore(repo_root="/r"))
+    assert beans[0].confidence in ("AMBIGUOUS", "SYMBOLIC")
+    assert "unresolved" in beans[0].provenance

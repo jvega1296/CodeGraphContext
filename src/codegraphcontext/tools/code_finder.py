@@ -111,6 +111,47 @@ def _sanitize_depth(depth, default: int = 3) -> int:
     return max(1, min(depth, _MAX_TRAVERSAL_DEPTH))
 
 
+_IMPACT_DIRECTIONS = ("upstream", "downstream", "both")
+_IMPACT_REL_TYPES = "CALLS|INHERITS|IMPLEMENTS|INJECTS|DECORATED_BY|IMPORTS"
+
+
+def _propagation_query(direction: str, depth: int) -> str:
+    """Change-propagation traversal query for analyze_impact.
+
+    Upstream finds what calls into the target (arrow points at ``target``);
+    downstream finds what the target's output drives (arrow points away from
+    ``target``).
+    """
+    if direction == "downstream":
+        return f"""
+            MATCH p = (target)-[:{_IMPACT_REL_TYPES}*1..{depth}]->(sink)
+            WHERE target.uid IN $target_uids
+            RETURN [n in nodes(p) | {{uid: n.uid, name: n.name, path: n.path, labels: labels(n)}}] as path_nodes,
+                   [rel in relationships(p) | {{type: type(rel), line_number: coalesce(rel.line_number, 0)}}] as path_rels
+        """
+    return f"""
+        MATCH p = (source)-[:{_IMPACT_REL_TYPES}*1..{depth}]->(target)
+        WHERE target.uid IN $target_uids
+        RETURN [n in nodes(p) | {{uid: n.uid, name: n.name, path: n.path, labels: labels(n)}}] as path_nodes,
+               [rel in relationships(p) | {{type: type(rel), line_number: coalesce(rel.line_number, 0)}}] as path_rels
+    """
+
+
+def _criticality_query(direction: str) -> str:
+    """Criticality query for analyze_impact: in-degree upstream, out-degree downstream."""
+    if direction == "downstream":
+        return f"""
+            MATCH (target)-[r:{_IMPACT_REL_TYPES}]->()
+            WHERE target.uid IN $target_uids
+            RETURN count(r) as count
+        """
+    return f"""
+        MATCH (target)<-[r:{_IMPACT_REL_TYPES}]-()
+        WHERE target.uid IN $target_uids
+        RETURN count(r) as count
+    """
+
+
 def _levenshtein_distance(a: str, b: str) -> int:
     """Levenshtein distance for short identifiers (typo-tolerant name search)."""
     if len(a) < len(b):
@@ -1842,13 +1883,37 @@ class CodeFinder:
         target_type: Optional[str] = None,
         repo_path: Optional[str] = None,
         depth: int = 3,
+        direction: str = "upstream",
+        max_wire_hops: int = 2,  # unused until Task 7; accepted now so the signature is stable
     ) -> Dict[str, Any]:
-        """Analyze semantic code impact and propagation upstream."""
+        """Analyze semantic code impact and propagation upstream or downstream."""
         import subprocess
         import shutil
         from pathlib import Path
 
         depth = _sanitize_depth(depth, default=3)
+
+        if direction not in _IMPACT_DIRECTIONS:
+            return {
+                "target": {"name": target, "type": target_type or "Unknown", "path": ""},
+                "impact_score": 0.0,
+                "risk_level": "Low",
+                "warning": f"Invalid direction '{direction}'. Must be one of: {', '.join(_IMPACT_DIRECTIONS)}.",
+                "affected_nodes": [],
+                "propagation_paths": [],
+                "explanations": [],
+                "risk_breakdown": {
+                    "depth_score": 0.0,
+                    "module_score": 0.0,
+                    "criticality_score": 0.0,
+                    "churn_score": 0.0,
+                },
+            }
+
+        if direction == "both":
+            # TODO(Task 9): implement the merged upstream+downstream connected
+            # trace. See .superpowers/sdd/2026-10-29-oms-cross-repo-graph-plan/.
+            raise NotImplementedError("direction='both' is implemented in Task 9")
 
         # 1. Resolve repo root
         repo_root = repo_path
@@ -1933,17 +1998,13 @@ class CodeFinder:
                     "criticality_score": 0.0,
                     "churn_score": 0.0,
                 },
+                "direction": direction,
             }
 
         target_uids = [n["uid"] for n in target_nodes]
 
-        # 2. Upstream change propagation query
-        propagation_query = f"""
-            MATCH p = (source)-[:CALLS|INHERITS|IMPLEMENTS|INJECTS|DECORATED_BY|IMPORTS*1..{depth}]->(target)
-            WHERE target.uid IN $target_uids
-            RETURN [n in nodes(p) | {{uid: n.uid, name: n.name, path: n.path, labels: labels(n)}}] as path_nodes,
-                   [rel in relationships(p) | {{type: type(rel), line_number: coalesce(rel.line_number, 0)}}] as path_rels
-        """
+        # 2. Change propagation query (upstream or downstream)
+        propagation_query = _propagation_query(direction, depth)
 
         paths = []
         affected_nodes_map = {}
@@ -1997,11 +2058,7 @@ class CodeFinder:
 
         in_degree = 0
         with self.driver.session() as session:
-            criticality_query = """
-                MATCH (target)<-[r:CALLS|INHERITS|IMPLEMENTS|INJECTS|DECORATED_BY|IMPORTS]-()
-                WHERE target.uid IN $target_uids
-                RETURN count(r) as count
-            """
+            criticality_query = _criticality_query(direction)
             res_crit = session.run(criticality_query, target_uids=target_uids)
             record = res_crit.single()
             if record:
@@ -2106,5 +2163,6 @@ class CodeFinder:
                 "criticality_score": round(criticality_score, 2),
                 "churn_score": round(churn_score, 2),
             },
+            "direction": direction,
         }
 

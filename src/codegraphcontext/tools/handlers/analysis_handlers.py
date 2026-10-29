@@ -355,17 +355,19 @@ def analyze_impact(code_finder: CodeFinder, **args) -> Dict[str, Any]:
     target_type = args.get("target_type")
     repo_path = args.get("repo_path")
     depth = args.get("depth", 3)
+    direction = args.get("direction", "upstream")
 
     if not target:
         return {"error": "'target' is a required argument"}
 
     try:
-        debug_log(f"Analyzing semantic impact for: {target}, target_type={target_type}, depth={depth}, repo_path={repo_path}")
+        debug_log(f"Analyzing semantic impact for: {target}, target_type={target_type}, depth={depth}, direction={direction}, repo_path={repo_path}")
         results = code_finder.analyze_impact(
             target=target,
             target_type=target_type,
             repo_path=repo_path,
-            depth=depth
+            depth=depth,
+            direction=direction
         )
         return {
             "success": True,

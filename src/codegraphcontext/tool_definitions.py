@@ -574,6 +574,12 @@ TOOLS = {
                     "type": "integer",
                     "description": "Optional: Maximum traversal depth for change propagation (default: 3).",
                     "default": 3
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["upstream", "downstream", "both"],
+                    "description": "Optional: traversal direction. 'upstream' (default) finds what depends on/calls into the target. 'downstream' finds what the target's output drives. 'both' returns one merged connected trace covering both.",
+                    "default": "upstream"
                 }
             },
             "required": ["target"]

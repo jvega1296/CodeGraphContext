@@ -56,7 +56,20 @@ class _FakeSession:
                     ]
                 }
             ])
-            
+
+        elif "MATCH p = (target)-[:CALLS" in query:
+            return _FakeResult([
+                {
+                    "path_nodes": [
+                        {"uid": "func_create_order", "name": "createOrder", "path": "src/orders.py", "labels": ["Function"]},
+                        {"uid": "func_validate_order", "name": "validateOrder", "path": "src/orders.py", "labels": ["Function"]}
+                    ],
+                    "path_rels": [
+                        {"type": "CALLS", "line_number": 10}
+                    ]
+                }
+            ])
+
         elif "MATCH (target)<-[r:CALLS" in query:
             return _FakeResult([{"count": 5}])
 
@@ -119,8 +132,16 @@ def test_analyze_impact_file_target():
 def test_analyze_impact_not_found():
     finder, recorder = _make_finder()
     res = finder.analyze_impact(target="NonExistentSymbol")
-    
+
     assert res["impact_score"] == 0.0
     assert res["risk_level"] == "Low"
     assert "warning" in res
     assert len(res["affected_nodes"]) == 0
+
+def test_analyze_impact_downstream_direction_reverses_query_arrow():
+    finder, recorder = _make_finder()
+    res = finder.analyze_impact(target="AuthService", direction="downstream")
+    assert res["direction"] == "downstream"
+    assert len(res["propagation_paths"]) == 1
+    # the canned downstream fixture row proves the reversed-arrow query ran
+    assert res["propagation_paths"][0]["nodes"][-1]["name"] == "validateOrder"

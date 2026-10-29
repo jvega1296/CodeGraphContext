@@ -51,7 +51,7 @@ class PubsubPublisherRecord:
     topic_raw: str          # exact string arg from source (may contain ${...})
     topic_resolved: str     # after ConfigValueStore resolution (== raw if literal)
     confidence: str         # EXTRACTED | INFERRED | SYMBOLIC | AMBIGUOUS
-    provenance: str         # short human tag: literal / config:<key> / unresolved:<key> / identifier:<name>
+    provenance: str         # short human tag: literal / config:<key> / unresolved:<key> / identifier:<name> / unresolved:identifier:<name>
     source_file: str
     line: int               # 1-based
     call_shape: str         # "PubSubTemplate.publish"
@@ -280,13 +280,19 @@ def _is_pubsub_template_receiver(ident: str, fields: set) -> bool:
     The declared-type set catches ``private final PubSubTemplate x;``-style
     fields; the name fallback covers call sites where the declaration isn't
     visible in the snippet (e.g. an autowired field elsewhere) but the
-    variable still carries the conventional ``pubSubTemplate`` name. This is
-    what keeps a raw GCP client's ``publisher.publish(message)`` call from
-    being mistaken for a Spring Cloud GCP producer.
+    variable still carries the conventional ``pubSubTemplate`` name.
+
+    The fallback deliberately checks for ``pubsubtemplate`` as one word, not
+    just ``pubsub`` — a raw ``com.google.cloud.pubsub.v1.Publisher`` field
+    can plausibly be named ``pubsubClient`` or ``pubsubPublisher`` in real
+    code, and a bare ``"pubsub" in name`` check would wrongly treat that as
+    a recognized Spring Cloud GCP producer instead of flowing it to the
+    "recognized nothing" warning path like the plain ``publisher`` anti-goal
+    case.
     """
     if ident in fields:
         return True
-    return "pubsub" in ident.lower()
+    return "pubsubtemplate" in ident.lower()
 
 
 # ── Value parsing (literal / placeholder / identifier) ─────────────────────

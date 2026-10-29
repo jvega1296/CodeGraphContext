@@ -72,3 +72,22 @@ def test_unrecognized_pubsub_usage_emits_warning_not_silence():
     result = extract_publishers_from_source(source, Path("/r/RawPublisher.java"))
     assert result.publishers == []
     assert any("raw" in w.lower() or "unrecognized" in w.lower() or "Publisher" in w for w in result.warnings)
+
+
+def test_raw_publisher_field_named_with_pubsub_is_not_misclassified():
+    """A raw com.google.cloud.pubsub.v1.Publisher field happening to be named
+    with "pubsub" in it (e.g. pubsubClient) must not be mistaken for a Spring
+    Cloud GCP PubSubTemplate producer just because of its name — it is
+    declared as `Publisher`, not `PubSubTemplate`, so the receiver check must
+    fail here the same way it does for the plain `publisher` anti-goal case.
+    """
+    source = """
+    import com.google.cloud.pubsub.v1.Publisher;
+    public class RawNamedPublisher {
+        private final Publisher pubsubClient;
+        public void send() { pubsubClient.publish(message); }
+    }
+    """
+    result = extract_publishers_from_source(source, Path("/r/RawNamedPublisher.java"))
+    assert result.publishers == []
+    assert any("raw" in w.lower() or "unrecognized" in w.lower() or "Publisher" in w for w in result.warnings)

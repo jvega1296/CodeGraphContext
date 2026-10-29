@@ -65,3 +65,57 @@ def test_unmatched_channel_adapter_bean_emits_warning(tmp_path):
     result = scan_repo_pubsub(tmp_path)
     assert result.subscribers == []
     assert any("someChannel" in w for w in result.warnings)
+
+
+def test_unmatched_activator_warning_is_suppressed_when_repo_has_no_pubsub_beans(tmp_path):
+    """@ServiceActivator is generic Spring Integration chaining machinery used far
+    beyond Pub/Sub consumption. A repo with zero Pub/Sub channel-adapter beans has
+    nothing to join against, so flagging every unrelated @ServiceActivator there
+    would just be noise — see the plan-mandated ruling on this finding."""
+    _write(tmp_path / "src/main/java/Pipeline.java", """
+    @Component
+    public class Pipeline {
+        @ServiceActivator(inputChannel = "nonPubsubChannel")
+        public void transform(Message<String> message) { }
+    }
+    """)
+    result = scan_repo_pubsub(tmp_path)
+    assert result.subscribers == []
+    assert not any("nonPubsubChannel" in w for w in result.warnings)
+
+
+def test_unmatched_activator_still_warns_when_repo_has_other_pubsub_beans(tmp_path):
+    """The suppression above must not swallow a genuinely unmatched activator
+    sitting alongside an unrelated, successfully matched bean/activator pair in
+    the same repo."""
+    _write(tmp_path / "src/main/java/ListenerConfig.java", """
+    @Configuration
+    public class ListenerConfig {
+        @Bean
+        public PubSubInboundChannelAdapter adapter(
+            @Qualifier("channelA") MessageChannel channelA, PubSubTemplate t) {
+          PubSubInboundChannelAdapter a = new PubSubInboundChannelAdapter(t, "sub-a");
+          a.setOutputChannel(channelA);
+          return a;
+        }
+    }
+    """)
+    _write(tmp_path / "src/main/java/ListenerService.java", """
+    @Service
+    public class ListenerService {
+        @ServiceActivator(inputChannel = "channelA")
+        public void onA(Message<String> message) { }
+    }
+    """)
+    _write(tmp_path / "src/main/java/Pipeline.java", """
+    @Component
+    public class Pipeline {
+        @ServiceActivator(inputChannel = "channelX")
+        public void onX(Message<String> message) { }
+    }
+    """)
+    result = scan_repo_pubsub(tmp_path)
+    assert len(result.subscribers) == 1
+    assert result.subscribers[0].fqn.endswith("ListenerService.onA")
+    assert any("channelX" in w for w in result.warnings)
+    assert not any("channelA" in w and "no channel-adapter bean" in w for w in result.warnings)

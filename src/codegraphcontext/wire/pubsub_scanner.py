@@ -161,15 +161,27 @@ def scan_repo_pubsub(
                 line=activator.line,
             ))
 
-    for activator in activators:
-        if id(activator) in matched_activator_ids:
-            continue
-        result.warnings.append(
-            f"{activator.source_file}: {activator.fqn} declares "
-            f"@ServiceActivator(inputChannel = {activator.input_channel_raw!r}) but no "
-            "channel-adapter bean anywhere in the repo matches it; this activator is "
-            "not joined to a publisher-side subscription"
-        )
+    # @ServiceActivator is generic Spring Integration chaining machinery used far
+    # beyond Pub/Sub consumption (transformer/router/service-activator pipelines,
+    # etc.) — extract_service_activators_from_source captures every one in the
+    # repo unconditionally, with no way to know in advance which are Pub/Sub
+    # related. In a repo with zero Pub/Sub channel-adapter beans, there is
+    # nothing to join against and essentially every activator there is unrelated
+    # internal chaining, so the unmatched-activator warning is scoped to repos
+    # that demonstrably use at least one Pub/Sub bean somewhere. The
+    # unmatched-BEAN warning above has no equivalent noise problem — a @Bean
+    # constructing PubSubInboundChannelAdapter is unambiguous Pub/Sub machinery
+    # by construction — and stays unconditional.
+    if beans:
+        for activator in activators:
+            if id(activator) in matched_activator_ids:
+                continue
+            result.warnings.append(
+                f"{activator.source_file}: {activator.fqn} declares "
+                f"@ServiceActivator(inputChannel = {activator.input_channel_raw!r}) but "
+                "no channel-adapter bean anywhere in the repo matches it; this "
+                "activator's consumer-side wiring is not joined to a Pub/Sub subscription"
+            )
 
     return result
 

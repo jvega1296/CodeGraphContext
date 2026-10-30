@@ -57,6 +57,11 @@ class _FakeSession:
                 return _FakeResult([{"uid": "func_on_order_create", "name": "onOrderCreateEvent", "path": "src/oms-order-consumer/OrderCreateListener.java", "labels": ["Function"]}])
             if kwargs.get("target") == "consumeOrphanEvent":
                 return _FakeResult([{"uid": "func_consume_orphan_event", "name": "consumeOrphanEvent", "path": "src/oms-order-consumer/OrphanEventListener.java", "labels": ["Function"]}])
+            if kwargs.get("target") == "validateOrder":
+                # Same uid as the downstream canned path fixture's leaf node
+                # below, so direction="both" resolving "validateOrder" and
+                # then tracing downstream from it are consistent.
+                return _FakeResult([{"uid": "func_validate_order", "name": "validateOrder", "path": "src/orders.py", "labels": ["Function"]}])
             return _FakeResult([])
             
         elif "MATCH p = (source)-[:CALLS" in query:
@@ -258,6 +263,29 @@ def test_upstream_trace_reports_unresolved_crossing_for_dead_end_topic():
     finder, recorder = _make_finder()
     res = finder.analyze_impact(target="consumeOrphanEvent", direction="upstream")
     assert any(c["topic"] == "orphan-event-topic" for c in res["unresolved_crossings"])
+
+def test_analyze_impact_both_returns_one_merged_connected_trace_not_two_lists():
+    finder, recorder = _make_finder()
+    res = finder.analyze_impact(target="validateOrder", direction="both")
+    assert res["direction"] == "both"
+    assert "nodes" in res and "edges" in res
+    assert "propagation_paths" not in res, "both must not just concatenate two separate upstream/downstream result sets"
+    target_node = next(n for n in res["nodes"] if n["role"] == "target")
+    assert target_node["name"] == "validateOrder"
+    roles = {n["role"] for n in res["nodes"]}
+    assert "upstream" in roles and "downstream" in roles, "both must include nodes from both directions in the same node list"
+    # Every edge must connect two uids present in the same `nodes` list -- this is what makes it "connected"
+    node_uids = {n["uid"] for n in res["nodes"]}
+    for e in res["edges"]:
+        assert e["source_uid"] in node_uids and e["target_uid"] in node_uids
+
+@pytest.mark.skip(reason="requires Task 12's BACKED_BY edge in the bridging query -- un-skip when Piece 3 lands")
+def test_analyze_impact_both_on_create_order_includes_consumer_repo_and_terraform_node():
+    finder, recorder = _make_finder()
+    res = finder.analyze_impact(target="createOrder", direction="both", max_wire_hops=2)
+    node_types_by_repo = {n["path"]: n["type"] for n in res["nodes"]}
+    assert any("oms-order-consumer" in p for p in node_types_by_repo), "consumer repo missing"
+    assert any(n["type"] == "Class" and "terra-projects-oms" in n["path"] for n in res["nodes"]), "Terraform node missing (requires Piece 3's BACKED_BY stitching to be reachable too -- extend the fake fixture once Task 12 lands)"
 
 @pytest.mark.parametrize("backend", ["neo4j", "falkordb"])
 def test_portable_field_helpers_handle_real_driver_objects(backend):

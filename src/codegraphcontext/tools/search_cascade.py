@@ -14,7 +14,7 @@ is ever opened.
 from __future__ import annotations
 
 import sqlite3
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .code_finder import _portable_node_fields
 from .indexing.embeddings import _get_embedder
@@ -85,7 +85,9 @@ def _hydrate(session, pairs: List[Tuple[str, float]]) -> List[Dict[str, Any]]:
     return hydrated
 
 
-def search_code_cascade(code_finder, query: str, limit: int = 20) -> Dict[str, Any]:
+def search_code_cascade(
+    code_finder, query: str, limit: int = 20, repo_path: Optional[str] = None
+) -> Dict[str, Any]:
     """Cascade exact -> FTS5 -> semantic search, stopping at the first tier
     that finds anything. Returns `{"results": [...], "tier_used":
     "exact"|"fts5"|"semantic"|"none", "query": query}`.
@@ -95,9 +97,13 @@ def search_code_cascade(code_finder, query: str, limit: int = 20) -> Dict[str, A
     `fuzzy_search=False` -- `find_by_function_name`/`find_by_class_name`
     only read `edit_distance` inside their own `if fuzzy_search:` branches
     -- but `find_related_code` requires the parameter regardless.
+
+    `repo_path` only scopes the exact tier (`find_related_code` already
+    accepts and applies it there) -- the FTS5 and semantic tiers have no
+    repo-scoping of their own and are out of scope for this parameter.
     """
     exact = code_finder.find_related_code(
-        query, fuzzy_search=False, edit_distance=2, repo_path=None
+        query, fuzzy_search=False, edit_distance=2, repo_path=repo_path
     )
     # find_related_code always returns every key (ranked_results=[],
     # total_matches=0 on a true miss), so the dict itself is always truthy;

@@ -580,6 +580,16 @@ TOOLS = {
                     "enum": ["upstream", "downstream", "both"],
                     "description": "Optional: traversal direction. 'upstream' (default) finds what depends on/calls into the target. 'downstream' finds what the target's output drives. 'both' returns one merged connected trace covering both.",
                     "default": "upstream"
+                },
+                "max_wire_hops": {
+                    "type": "integer",
+                    "description": "Optional: maximum cross-repo wire-bridging BFS depth through Pub/Sub/Kafka/HTTP/gRPC coupling edges (default: 2).",
+                    "default": 2
+                },
+                "include_churn": {
+                    "type": "boolean",
+                    "description": "Optional: include the git-churn risk factor in risk_score (shells out to git; set false to skip if git history is slow/unavailable; default: true).",
+                    "default": True
                 }
             },
             "required": ["target"]

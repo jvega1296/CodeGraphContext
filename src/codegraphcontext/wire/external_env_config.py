@@ -108,6 +108,36 @@ def _walk_yaml_files(root: Path, *, skip_dirs: bool) -> List[Path]:
     return found
 
 
+def _find_service_dirs(sibling: Path, service_name: str) -> List[Path]:
+    """Return every directory under ``sibling`` named ``service_name``.
+
+    Equivalent to ``sibling.rglob(service_name)`` but prunes
+    ``_SKIP_DIR_NAMES`` during the walk itself, the same way
+    ``_walk_yaml_files(skip_dirs=True)`` prunes them for the in-repo tree
+    walk. Without this, finding the one directory name this search actually
+    wants would still require descending into every sibling's own
+    ``.git``/``node_modules``/``target``/``build`` subtree first -- on a
+    workspace with many large sibling checkouts (this feature's own stated
+    "60+ microservices" target environment) that is a real per-index-run
+    cost, not just a cosmetic inefficiency.
+    """
+    found: List[Path] = []
+    stack = [sibling]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_dir() or entry.name in _SKIP_DIR_NAMES:
+                continue
+            if entry.name == service_name:
+                found.append(entry)
+            stack.append(entry)
+    return found
+
+
 def discover_external_env_config(
     repo_root: Path, *, workspace_root: Optional[Path] = None, max_files: int = 200,
 ) -> ExternalEnvConfig:
@@ -146,10 +176,7 @@ def discover_external_env_config(
         for sibling in sorted(workspace_root.iterdir()):
             if not sibling.is_dir() or sibling.resolve() == repo_root:
                 continue
-            try:
-                service_dirs = [p for p in sibling.rglob(service_name) if p.is_dir()]
-            except OSError:
-                continue
+            service_dirs = _find_service_dirs(sibling, service_name)
             for service_dir in service_dirs:
                 candidate_files.extend(_walk_yaml_files(service_dir, skip_dirs=False))
 

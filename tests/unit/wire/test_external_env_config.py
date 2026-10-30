@@ -135,3 +135,41 @@ def test_ci_pipeline_env_blocks_outside_deploy_dirs_are_still_picked_up_by_shape
     _write(app_repo / ".github" / "workflows" / "ci.yml", "env:\n  - name: SHOULD_NOT_APPEAR\n    value: x\n")
     result = discover_external_env_config(app_repo, workspace_root=workspace)
     assert result.env_vars == {}
+
+
+def test_sibling_scan_does_not_descend_into_a_sibling_s_node_modules_tree(tmp_path: Path):
+    """The top-level sibling-directory traversal that FINDS a
+    name-matching service directory in the first place must prune
+    `_SKIP_DIR_NAMES` the same way the in-repo walk does -- a service-named
+    directory nested inside a sibling's own `node_modules` (or `.git`,
+    `target`, `build`, ...) tree must not be treated as a real match, and
+    (more importantly, since this is what the unbounded `rglob` used to do)
+    that subtree must not be walked at all to find it."""
+    workspace = tmp_path
+    app_repo = workspace / "oms-order-consumer"
+    app_repo.mkdir()
+
+    sibling = workspace / "some-teams-ops-configs"
+    # A directory that happens to be named exactly like the indexed repo,
+    # but buried inside a dependency tree a real scan must never need to
+    # enter -- if this file gets picked up, pruning did not happen.
+    _write(
+        sibling / "node_modules" / "oms-order-consumer" / "dv1" / "config.yaml",
+        "env:\n  - name: SHOULD_NOT_APPEAR\n    value: from-node-modules\n",
+    )
+    # A second decoy under .git for the same reason.
+    _write(
+        sibling / ".git" / "oms-order-consumer" / "dv1" / "config.yaml",
+        "env:\n  - name: SHOULD_ALSO_NOT_APPEAR\n    value: from-dot-git\n",
+    )
+    # A real, non-pruned match alongside the decoys, proving the fix only
+    # prunes the skip-listed directories and does not break genuine
+    # discovery elsewhere in the same sibling.
+    _write(
+        sibling / "order-management" / "oms-order-consumer" / "dv1" / "config.yaml",
+        "env:\n  - name: REAL_KEY\n    value: real-value\n",
+    )
+
+    result = discover_external_env_config(app_repo, workspace_root=workspace)
+    assert result.env_vars == {"REAL_KEY": "real-value"}
+    assert len(result.source_files) == 1

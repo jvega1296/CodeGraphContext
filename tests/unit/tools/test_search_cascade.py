@@ -204,6 +204,29 @@ def test_search_code_cascade_passes_edit_distance_to_find_related_code(fake_code
     assert call["repo_path"] is None
 
 
+def test_search_code_cascade_forwards_repo_path_to_find_related_code_exact_tier(fake_code_finder_with_exact_match):
+    """Regression guard for the final-review Important #2 finding:
+    `search_code_cascade` used to hardcode `repo_path=None` regardless of
+    what the caller passed, making the schema-advertised `repo_path`
+    functionally inert. `find_related_code` already scopes the exact tier
+    with whatever `repo_path` it is given (code_finder.py); this test only
+    proves the cascade actually forwards the caller's value there, not that
+    find_related_code's own scoping Cypher is correct (that is pre-existing,
+    separately-owned behavior, out of scope for this fix)."""
+    search_code_cascade(fake_code_finder_with_exact_match, "createOrder", repo_path="/repos/oms-order-consumer")
+    call = fake_code_finder_with_exact_match.find_related_code_calls[0]
+    assert call["repo_path"] == "/repos/oms-order-consumer"
+
+
+def test_search_code_cascade_repo_path_still_defaults_to_none(fake_code_finder_with_exact_match):
+    """Backward-compat: callers that never pass repo_path (the overwhelming
+    majority, and every pre-existing caller of this function) must keep
+    searching the whole index, not suddenly start scoping to something."""
+    search_code_cascade(fake_code_finder_with_exact_match, "createOrder")
+    call = fake_code_finder_with_exact_match.find_related_code_calls[0]
+    assert call["repo_path"] is None
+
+
 def test_search_code_cascade_exact_tier_respects_limit():
     many_matches = [
         {"name": f"fn{i}", "path": "/repo/x.py", "relevance_score": 1.0 - i / 100}

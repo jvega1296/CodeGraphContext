@@ -358,18 +358,22 @@ def analyze_impact(code_finder: CodeFinder, **args) -> Dict[str, Any]:
     repo_path = args.get("repo_path")
     depth = args.get("depth", 3)
     direction = args.get("direction", "upstream")
+    max_wire_hops = args.get("max_wire_hops", 2)
+    include_churn = args.get("include_churn", True)
 
     if not target:
         return {"error": "'target' is a required argument"}
 
     try:
-        debug_log(f"Analyzing semantic impact for: {target}, target_type={target_type}, depth={depth}, direction={direction}, repo_path={repo_path}")
+        debug_log(f"Analyzing semantic impact for: {target}, target_type={target_type}, depth={depth}, direction={direction}, repo_path={repo_path}, max_wire_hops={max_wire_hops}, include_churn={include_churn}")
         results = code_finder.analyze_impact(
             target=target,
             target_type=target_type,
             repo_path=repo_path,
             depth=depth,
-            direction=direction
+            direction=direction,
+            max_wire_hops=max_wire_hops,
+            include_churn=include_churn
         )
         return {
             "success": True,
@@ -416,10 +420,9 @@ def search_code(code_finder: CodeFinder, **args) -> Dict[str, Any]:
     Task 21). Use when an exact/fuzzy name match from 'find_code' may not
     exist.
 
-    'repo_path' is accepted in the schema to match this codebase's other
-    search tools, but `search_code_cascade`'s fixed interface (Task 21's
-    plan) takes no repo_path -- its exact tier always searches the whole
-    index. Logged here for operator visibility; not forwarded further.
+    'repo_path' only scopes the exact tier -- `search_code_cascade` forwards
+    it into `find_related_code`, which already applies it there. The FTS5
+    and semantic tiers have no repo-scoping of their own.
     """
     query = args.get("query")
     if not query:
@@ -431,9 +434,9 @@ def search_code(code_finder: CodeFinder, **args) -> Dict[str, Any]:
     try:
         debug_log(
             f"Searching code (cascade) for query: {query}, limit={limit}, "
-            f"repo_path={repo_path} (not yet honored by search_code_cascade)"
+            f"repo_path={repo_path}"
         )
-        result = search_code_cascade(code_finder, query, limit=limit)
+        result = search_code_cascade(code_finder, query, limit=limit, repo_path=repo_path)
         return {"success": True, **result}
     except Exception as e:
         debug_log(f"Error searching code (cascade): {str(e)}")

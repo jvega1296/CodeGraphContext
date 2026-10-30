@@ -407,31 +407,38 @@ class _FakeNodeResult:
 class _FakeNodeSession:
     """Minimal fake session for map_changes_to_nodes, matching this
     codebase's established `.run(query, **kwargs)` fake-session convention.
+
+    Holds a flat list of node rows (not keyed by exact path) and replays the
+    real query's `ENDS WITH $file_path OR path = $file_path` filter against
+    each row's stored `n.path`, so tests actually exercise the suffix-match
+    fallback rather than just trusting it's wired in.
     """
 
-    def __init__(self, nodes_by_path: Dict[str, List[Dict[str, Any]]]):
-        self._nodes_by_path = nodes_by_path
+    def __init__(self, nodes: List[Dict[str, Any]]):
+        self._nodes = nodes
 
     def run(self, query: str, **kwargs: Any) -> _FakeNodeResult:
-        if "n:Function OR n:Class" in query:
+        if "n.path ENDS WITH $file_path OR n.path = $file_path" in query:
             file_path = kwargs.get("file_path")
-            return _FakeNodeResult(self._nodes_by_path.get(file_path, []))
+            matched = [
+                node for node in self._nodes
+                if node["n.path"].endswith(file_path) or node["n.path"] == file_path
+            ]
+            return _FakeNodeResult(matched)
         return _FakeNodeResult([])
 
 
 @pytest.fixture
 def fake_session_with_one_function_lines_10_to_30() -> _FakeNodeSession:
-    return _FakeNodeSession({
-        "src/main/java/Foo.java": [
-            {
-                "n.uid": "func_foo",
-                "n.name": "foo",
-                "n.path": "src/main/java/Foo.java",
-                "n.line_number": 10,
-                "n.end_line": 30,
-            },
-        ],
-    })
+    return _FakeNodeSession([
+        {
+            "n.uid": "func_foo",
+            "n.name": "foo",
+            "n.path": "src/main/java/Foo.java",
+            "n.line_number": 10,
+            "n.end_line": 30,
+        },
+    ])
 
 
 def test_map_changes_to_nodes_overlap_check(fake_session_with_one_function_lines_10_to_30):
@@ -445,14 +452,51 @@ def test_map_changes_to_nodes_excludes_non_overlapping_range(fake_session_with_o
 
 
 def test_map_changes_to_nodes_handles_multiple_ranges_and_files():
-    session = _FakeNodeSession({
-        "a.py": [
-            {"n.uid": "func_a", "n.name": "a", "n.path": "a.py", "n.line_number": 1, "n.end_line": 5},
-        ],
-        "b.py": [
-            {"n.uid": "func_b", "n.name": "b", "n.path": "b.py", "n.line_number": 100, "n.end_line": 120},
-        ],
-    })
+    session = _FakeNodeSession([
+        {"n.uid": "func_a", "n.name": "a", "n.path": "a.py", "n.line_number": 1, "n.end_line": 5},
+        {"n.uid": "func_b", "n.name": "b", "n.path": "b.py", "n.line_number": 100, "n.end_line": 120},
+    ])
     nodes = map_changes_to_nodes(session, {"a.py": [(1, 2)], "b.py": [(200, 210), (110, 115)]})
     uids = {n["uid"] for n in nodes}
     assert uids == {"func_a", "func_b"}
+
+
+def test_map_changes_to_nodes_suffix_match_fallback_catches_path_form_mismatch():
+    # The diff reports a repo-relative path ("src/main/java/Foo.java"), but
+    # the stored node's path is the full indexed path with a repo-root
+    # prefix ("/home/ci/checkout/oms-order-services/src/main/java/Foo.java")
+    # -- a bare `path = $file_path` would miss this node entirely, since
+    # neither side equals the other. ENDS WITH must still catch it.
+    session = _FakeNodeSession([
+        {
+            "n.uid": "func_foo",
+            "n.name": "foo",
+            "n.path": "/home/ci/checkout/oms-order-services/src/main/java/Foo.java",
+            "n.line_number": 10,
+            "n.end_line": 30,
+        },
+    ])
+    nodes = map_changes_to_nodes(session, {"src/main/java/Foo.java": [(25, 35)]})
+    assert len(nodes) == 1
+    assert nodes[0]["uid"] == "func_foo"
+
+
+def test_map_changes_to_nodes_bare_exact_match_alone_would_miss_the_suffix_case():
+    """Negative control proving the fallback is load-bearing, not redundant:
+    confirms a literal `path = $file_path` equality check against the same
+    fixture as the suffix-match test above would find nothing, so the
+    ENDS WITH branch is what makes that test pass, not accidental overlap."""
+    session = _FakeNodeSession([
+        {
+            "n.uid": "func_foo",
+            "n.name": "foo",
+            "n.path": "/home/ci/checkout/oms-order-services/src/main/java/Foo.java",
+            "n.line_number": 10,
+            "n.end_line": 30,
+        },
+    ])
+    exact_match_only = [
+        node for node in session._nodes
+        if node["n.path"] == "src/main/java/Foo.java"
+    ]
+    assert exact_match_only == []

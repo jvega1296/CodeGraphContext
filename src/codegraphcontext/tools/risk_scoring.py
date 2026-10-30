@@ -737,14 +737,20 @@ def map_changes_to_nodes(session, changed_ranges: Dict[str, List[Tuple[int, int]
 
     Queries CGC's graph directly via ``session`` (one Cypher call per changed
     file) rather than code-review-graph's ``GraphStore.get_nodes_by_file``,
-    which has no equivalent here. Exact-path match only: CGC's indexing
-    pipeline writes a single consistent path form per file, unlike the
-    original project's broader cross-tool compatibility surface, so the
-    suffix-match fallback the original also has is deliberately not ported.
+    which has no equivalent here. The diff's path (relative to the repo
+    root) and a stored node's ``path`` are not guaranteed to be in the same
+    form, so the ``ENDS WITH $file_path OR path = $file_path`` fallback
+    matches this codebase's own established idiom for that problem --
+    ``find_variable_usage_scope``, ``get_cyclomatic_complexity``,
+    ``find_most_complex_functions_in_file``, and the target-resolution query
+    in ``code_finder.py`` all use the same OR clause. A single query with
+    an OR is simpler than code-review-graph's original two-step Python-side
+    retry (exact lookup, then a separate suffix-match lookup only if the
+    first came back empty).
     """
     cypher = """
     MATCH (n)
-    WHERE n.path = $file_path AND (n:Function OR n:Class)
+    WHERE (n.path ENDS WITH $file_path OR n.path = $file_path) AND (n:Function OR n:Class)
     RETURN n.uid, n.name, n.path, n.line_number, n.end_line
     """
     matched: List[dict] = []

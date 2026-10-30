@@ -1,6 +1,7 @@
 """Tests for the core pure risk-scoring factors ported from code-review-graph."""
 
 import subprocess
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -12,8 +13,13 @@ from codegraphcontext.tools.risk_scoring import (
     clear_churn_cache,
     community_crossing_score,
     compute_file_churn_with_status,
+    find_test_coverage_count,
     security_sensitivity_score,
 )
+# `test_coverage_score` is imported locally inside the tests that use it
+# (not here at module level): its name matches pytest's `test_*` collection
+# prefix, so a bare top-level import would make pytest try to collect and
+# run it as a test function in its own right.
 
 
 @pytest.fixture(autouse=True)
@@ -125,3 +131,90 @@ def test_churn_score_formula():
     assert churn_score(5) == pytest.approx(5 / 10.0 * 0.15)
     assert churn_score(10) == pytest.approx(0.15)
     assert churn_score(1000) == pytest.approx(0.15)
+
+
+class _FakeFunctionResult:
+    """Mirrors tests/unit/tools/test_impact_analysis.py's _FakeResult shape
+    (`.data()` / `.single()` / `__iter__`) for a single aggregate row."""
+
+    def __init__(self, data_list: List[Dict[str, Any]]):
+        self._data = data_list
+
+    def data(self) -> List[Dict[str, Any]]:
+        return self._data
+
+    def single(self) -> Optional[Dict[str, Any]]:
+        if self._data:
+            return self._data[0]
+        return None
+
+    def __iter__(self):
+        return iter(self._data)
+
+
+class _FakeFunctionSession:
+    """Minimal fake session for find_test_coverage_count, matching this
+    codebase's established `.run(query, **kwargs)` fake-session convention
+    (see test_impact_analysis.py's _FakeSession). Rather than canning a
+    fixed count, it replays the same path-prefix/name-membership filter the
+    real Cypher query expresses, against a small in-memory Function-node
+    fixture -- so the test actually exercises find_test_coverage_count's
+    substitution logic instead of just trusting it.
+    """
+
+    def __init__(self, functions: List[Dict[str, str]]):
+        self._functions = functions
+
+    def run(self, query: str, **kwargs: Any) -> _FakeFunctionResult:
+        if "MATCH (fn:Function)" in query:
+            prefix = kwargs.get("test_tree_prefix", "")
+            candidate_names = set(kwargs.get("candidate_names", []))
+            count = sum(
+                1
+                for fn in self._functions
+                if fn["path"].startswith(prefix) and fn["name"] in candidate_names
+            )
+            return _FakeFunctionResult([{"count": count}])
+        return _FakeFunctionResult([])
+
+
+@pytest.fixture
+def fake_session_with_main_and_test_functions() -> _FakeFunctionSession:
+    functions = [
+        {"name": "validateOrder", "path": "src/main/java/com/az/oms/OrderValidator.java"},
+        {"name": "testValidateOrder", "path": "src/test/java/com/az/oms/OrderValidatorTest.java"},
+        {"name": "validateOrderTest", "path": "src/test/java/com/az/oms/OrderValidatorTests.java"},
+        # Decoy A: correct directory, but the name doesn't match any
+        # test-naming variant -- must not be counted.
+        {"name": "helperMethod", "path": "src/test/java/com/az/oms/OrderValidatorTest.java"},
+        # Decoy B: a matching test-naming variant, but under a sibling
+        # package that doesn't share the target's directory prefix --
+        # must not be counted.
+        {"name": "testValidateOrder", "path": "src/test/java/com/az/shipping/OtherValidatorTest.java"},
+    ]
+    return _FakeFunctionSession(functions)
+
+
+def test_find_test_coverage_count_matches_colocated_junit_naming(fake_session_with_main_and_test_functions):
+    count = find_test_coverage_count(
+        fake_session_with_main_and_test_functions,
+        "validateOrder",
+        "src/main/java/com/az/oms/OrderValidator.java",
+    )
+    assert count == 2  # fixture has testValidateOrder and validateOrderTest, both under src/test/java/com/az/oms/
+
+
+def test_test_coverage_score_zero_tests_is_point_three():
+    from codegraphcontext.tools.risk_scoring import test_coverage_score
+
+    assert test_coverage_score(0) == pytest.approx(0.30)
+
+
+def test_test_coverage_score_five_or_more_tests_floors_at_point_zero_five():
+    # pytest.approx, not ==: 0.30 - 0.25 is 0.049999999999999988 in IEEE-754
+    # double precision, not exactly 0.05 -- the same float-dust reason
+    # test_churn_score_formula above compares with pytest.approx.
+    from codegraphcontext.tools.risk_scoring import test_coverage_score
+
+    assert test_coverage_score(5) == pytest.approx(0.05)
+    assert test_coverage_score(100) == pytest.approx(0.05)

@@ -84,6 +84,53 @@ def community_crossing_score(target_path: str, caller_paths: List[str]) -> float
     return min(crossings * 0.05, 0.15)
 
 
+def find_test_coverage_count(session, function_name: str, function_path: str) -> int:
+    """Count of Function nodes matching a Java/JUnit test-naming convention
+    (test<Name> / <name>Test / <Name>Test) that are co-located under the
+    mirrored src/test tree for function_path's package. Lightweight proxy
+    for a real TESTED_BY edge -- see Decision #4.
+
+    Scoped to Java/JUnit naming only, per Decision #4: the src/main -> src/test
+    substitution covers both ``src/main/java`` and ``src/main/kotlin`` -- the
+    two source roots DEFAULT_JAVA_SOURCE_DIRS already treats as siblings, and
+    Kotlin-on-JVM code commonly uses JUnit too -- but this does not generalize
+    to any other language's source-tree convention; an unrecognized layout
+    returns 0 rather than guessing.
+    """
+    posix_path = function_path.replace("\\", "/")
+    directory, _, _filename = posix_path.rpartition("/")
+    if not directory:
+        return 0
+
+    if "src/main/java" in directory:
+        test_directory = directory.replace("src/main/java", "src/test/java", 1)
+    elif "src/main/kotlin" in directory:
+        test_directory = directory.replace("src/main/kotlin", "src/test/kotlin", 1)
+    else:
+        return 0
+
+    test_tree_prefix = f"{test_directory}/"
+    candidate_names = [
+        f"test{function_name[0].upper()}{function_name[1:]}",
+        f"{function_name}Test",
+        f"{function_name[0].upper()}{function_name[1:]}Test",
+    ]
+
+    cypher = """
+    MATCH (fn:Function)
+    WHERE fn.path STARTS WITH $test_tree_prefix AND fn.name IN $candidate_names
+    RETURN count(fn) as count
+    """
+    result = session.run(cypher, test_tree_prefix=test_tree_prefix, candidate_names=candidate_names)
+    row = result.single()
+    return row["count"] if row else 0
+
+
+def test_coverage_score(test_count: int) -> float:
+    """0.30 - (min(test_count / 5.0, 1.0) * 0.25) -- exact port of the formula."""
+    return 0.30 - (min(test_count / 5.0, 1.0) * 0.25)
+
+
 _warned_env_vars: set[str] = set()
 
 

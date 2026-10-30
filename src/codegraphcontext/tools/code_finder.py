@@ -2177,48 +2177,22 @@ class CodeFinder:
 
         return new_path_fragments, newly_discovered_uids, unresolved_crossings
 
-    def analyze_impact(
-        self,
-        target: str,
-        target_type: Optional[str] = None,
-        repo_path: Optional[str] = None,
-        depth: int = 3,
-        direction: str = "upstream",
-        max_wire_hops: int = 2,  # wire-bridging BFS depth, both directions (Tasks 7-8)
-    ) -> Dict[str, Any]:
-        """Analyze semantic code impact and propagation upstream or downstream."""
-        import subprocess
-        import shutil
+    def _resolve_impact_target(
+        self, target: str, repo_path: Optional[str],
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Resolve analyze_impact's repo root and target node(s).
+
+        A file-path target expands to the file itself plus every symbol it
+        contains; a name target matches any symbol with that exact name.
+        Extracted (pure extraction, same queries, same behavior) so
+        direction="both" (Task 9) can resolve the target once and reuse the
+        node uids to seed its merged node map -- the uid isn't otherwise
+        recoverable from either direction's result, since neither
+        propagation_paths nor affected_nodes is guaranteed to carry it (see
+        _collect_direction_nodes's docstring for why).
+        """
         from pathlib import Path
 
-        depth = _sanitize_depth(depth, default=3)
-
-        if direction not in _IMPACT_DIRECTIONS:
-            return {
-                "target": {"name": target, "type": target_type or "Unknown", "path": ""},
-                "impact_score": 0.0,
-                "risk_level": "Low",
-                "warning": f"Invalid direction '{direction}'. Must be one of: {', '.join(_IMPACT_DIRECTIONS)}.",
-                "affected_nodes": [],
-                "propagation_paths": [],
-                "explanations": [],
-                "risk_breakdown": {
-                    "depth_score": 0.0,
-                    "module_score": 0.0,
-                    "criticality_score": 0.0,
-                    "churn_score": 0.0,
-                },
-                "direction": direction,
-                "cross_repo_hops": [],
-                "unresolved_crossings": [],
-            }
-
-        if direction == "both":
-            # TODO(Task 9): implement the merged upstream+downstream connected
-            # trace. See .superpowers/sdd/2026-10-29-oms-cross-repo-graph-plan/.
-            raise NotImplementedError("direction='both' is implemented in Task 9")
-
-        # 1. Resolve repo root
         repo_root = repo_path
         if not repo_root:
             repos = self.list_indexed_repositories()
@@ -2227,7 +2201,7 @@ class CodeFinder:
             else:
                 repo_root = str(Path.cwd())
 
-        target_nodes = []
+        target_nodes: List[Dict[str, Any]] = []
         with self.driver.session() as session:
             # Check if target matches a file path
             file_query = """
@@ -2285,6 +2259,276 @@ class CodeFinder:
                         "path": row["path"],
                         "type": node_type,
                     })
+
+        return repo_root, target_nodes
+
+    def _collect_direction_nodes(self, result: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """Every node (uid/name/path/type) one single-direction analyze_impact
+        result touches -- every node named anywhere in its propagation_paths,
+        plus everything in its affected_nodes.
+
+        affected_nodes alone is not enough: _apply_propagation_rows
+        (Task 6) deliberately excludes each path's *last* node from
+        affected_nodes (only intermediate hops get a "depth"), so a path's
+        final node -- upstream's original target, or downstream's deepest
+        sink -- would be missing here even though direction="both" (Task 9)
+        builds its edges straight from propagation_paths and therefore
+        references it. Skipping this step would produce edges pointing at
+        nodes absent from the merged trace's own node list.
+        """
+        nodes: Dict[str, Dict[str, Any]] = {}
+        for n in result["affected_nodes"]:
+            nodes[n["uid"]] = {
+                "uid": n["uid"], "name": n["name"], "path": n["path"], "type": n["type"],
+            }
+        for path in result["propagation_paths"]:
+            for n in path["nodes"]:
+                nodes.setdefault(n["uid"], {
+                    "uid": n["uid"], "name": n["name"], "path": n["path"], "type": n["type"],
+                })
+        return nodes
+
+    def _analyze_impact_both(
+        self,
+        target: str,
+        target_type: Optional[str],
+        repo_path: Optional[str],
+        depth: int,
+        max_wire_hops: int,
+    ) -> Dict[str, Any]:
+        """direction="both": run the upstream and downstream single-direction
+        traces (Task 6/7/8's already-reviewed logic, called exactly as any
+        other caller would) against the same resolved target, then merge
+        them into one connected graph fragment rather than two lists the
+        caller has to stitch together themselves (the plan's Decision
+        #75-81). Scoring is computed once, over the union of affected nodes
+        from both directions -- not as two separately-clamped per-direction
+        scores averaged or summed.
+        """
+        _repo_root, target_nodes = self._resolve_impact_target(target, repo_path)
+
+        if not target_nodes:
+            return {
+                "target": {"name": target, "type": target_type or "Unknown", "path": ""},
+                "direction": "both",
+                "nodes": [],
+                "edges": [],
+                "cross_repo_hops": [],
+                "unresolved_crossings": [],
+                "impact_score": 0.0,
+                "risk_level": "Low",
+                "risk_breakdown": {
+                    "depth_score": 0.0,
+                    "module_score": 0.0,
+                    "criticality_score": 0.0,
+                    "churn_score": 0.0,
+                },
+                "explanations": [],
+                "warning": f"No code symbol or file named '{target}' was found in the graph.",
+            }
+
+        downstream_result = self.analyze_impact(
+            target=target, target_type=target_type, repo_path=repo_path,
+            depth=depth, direction="downstream", max_wire_hops=max_wire_hops,
+        )
+        upstream_result = self.analyze_impact(
+            target=target, target_type=target_type, repo_path=repo_path,
+            depth=depth, direction="upstream", max_wire_hops=max_wire_hops,
+        )
+
+        # --- nodes: dict keyed by uid, role-tagged. Target seeded first so
+        # it always wins; a node touched by both directions (a path loops
+        # back) gets "both", otherwise whichever single direction it came
+        # from. ---
+        downstream_nodes = self._collect_direction_nodes(downstream_result)
+        upstream_nodes = self._collect_direction_nodes(upstream_result)
+
+        nodes_by_uid: Dict[str, Dict[str, Any]] = {}
+        for tn in target_nodes:
+            nodes_by_uid[tn["uid"]] = {
+                "uid": tn["uid"], "name": tn["name"], "path": tn["path"], "type": tn["type"],
+                "role": "target",
+            }
+
+        for uid, node in {**downstream_nodes, **upstream_nodes}.items():
+            if nodes_by_uid.get(uid, {}).get("role") == "target":
+                continue
+            in_downstream = uid in downstream_nodes
+            in_upstream = uid in upstream_nodes
+            role = "both" if (in_downstream and in_upstream) else (
+                "downstream" if in_downstream else "upstream"
+            )
+            nodes_by_uid[uid] = {**node, "role": role}
+
+        # --- edges: dict keyed by (source_uid, target_uid, type),
+        # direction-tagged, built from each direction's propagation_paths
+        # relationship lists (cross_repo_hops are reported separately, not
+        # folded in here as edges). ---
+        edges_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+        def _collect_edges(result: Dict[str, Any], edge_direction: str) -> None:
+            for path in result["propagation_paths"]:
+                p_nodes = path["nodes"]
+                p_rels = path["relationships"]
+                for i, rel in enumerate(p_rels):
+                    source_uid = p_nodes[i]["uid"]
+                    target_uid = p_nodes[i + 1]["uid"]
+                    key = (source_uid, target_uid, rel["type"])
+                    if key not in edges_by_key:
+                        edges_by_key[key] = {
+                            "source_uid": source_uid,
+                            "target_uid": target_uid,
+                            "type": rel["type"],
+                            "line_number": rel["line_number"],
+                            "direction": edge_direction,
+                        }
+
+        _collect_edges(downstream_result, "downstream")
+        _collect_edges(upstream_result, "upstream")
+
+        # --- cross_repo_hops / unresolved_crossings: concatenated and
+        # deduplicated by (topic, subscription) across both directions. ---
+        def _dedup_by_topic_subscription(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            seen: set = set()
+            merged: List[Dict[str, Any]] = []
+            for item in items:
+                key = (item.get("topic"), item.get("subscription"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+            return merged
+
+        cross_repo_hops = _dedup_by_topic_subscription(
+            downstream_result["cross_repo_hops"] + upstream_result["cross_repo_hops"]
+        )
+        unresolved_crossings = _dedup_by_topic_subscription(
+            downstream_result["unresolved_crossings"] + upstream_result["unresolved_crossings"]
+        )
+
+        # --- explanations: concatenated and deduplicated by text, the same
+        # rule the single-direction path already applies within one
+        # direction. ---
+        explanations: List[Dict[str, Any]] = []
+        seen_texts: set = set()
+        for e in downstream_result["explanations"] + upstream_result["explanations"]:
+            if e["text"] in seen_texts:
+                continue
+            seen_texts.add(e["text"])
+            explanations.append(e)
+
+        # --- scoring: computed once over the union of affected nodes from
+        # both directions -- same formulas the single-direction path
+        # already uses, re-applied to the merged set, not the two
+        # per-direction scores averaged or summed. ---
+        merged_affected: Dict[str, Dict[str, Any]] = {}
+        for n in downstream_result["affected_nodes"] + upstream_result["affected_nodes"]:
+            uid = n["uid"]
+            if uid not in merged_affected:
+                merged_affected[uid] = dict(n)
+            else:
+                merged_affected[uid]["depth"] = min(merged_affected[uid]["depth"], n["depth"])
+
+        max_depth_seen = max((n["depth"] for n in merged_affected.values()), default=0)
+        depth_score = min(max_depth_seen * 1.6, 5.0)
+
+        affected_files = set(n["path"] for n in merged_affected.values() if n.get("path"))
+        module_score = min(len(affected_files) * 0.75, 5.0)
+
+        # Criticality combines both directions' raw in/out-degree counts
+        # before clamping -- reusing either direction's already-clamped
+        # (min(..., 5.0)) per-direction criticality_score here would cap
+        # the combined total at 10.0 regardless of the real degree.
+        target_uids = [n["uid"] for n in target_nodes]
+        out_degree = 0
+        in_degree = 0
+        with self.driver.session() as session:
+            res_out = session.run(_criticality_query("downstream"), target_uids=target_uids)
+            rec_out = res_out.single()
+            if rec_out:
+                out_degree = rec_out["count"]
+            res_in = session.run(_criticality_query("upstream"), target_uids=target_uids)
+            rec_in = res_in.single()
+            if rec_in:
+                in_degree = rec_in["count"]
+        criticality_score = min((in_degree + out_degree) * 0.2, 5.0)
+
+        # churn_score is purely a function of target_nodes' file paths, not
+        # direction -- both sub-calls computed it identically. Reuse one
+        # rather than shelling out to git a third time.
+        churn_score = downstream_result["risk_breakdown"]["churn_score"]
+
+        impact_score = min(
+            10.0,
+            max(1.0, depth_score + module_score + criticality_score + churn_score),
+        )
+        impact_score = round(impact_score, 1)
+
+        if impact_score >= 7.0:
+            risk_level = "High"
+        elif impact_score >= 4.0:
+            risk_level = "Medium"
+        else:
+            risk_level = "Low"
+
+        return {
+            "target": downstream_result["target"],
+            "direction": "both",
+            "nodes": list(nodes_by_uid.values()),
+            "edges": list(edges_by_key.values()),
+            "cross_repo_hops": cross_repo_hops,
+            "unresolved_crossings": unresolved_crossings,
+            "impact_score": impact_score,
+            "risk_level": risk_level,
+            "risk_breakdown": {
+                "depth_score": round(depth_score, 2),
+                "module_score": round(module_score, 2),
+                "criticality_score": round(criticality_score, 2),
+                "churn_score": round(churn_score, 2),
+            },
+            "explanations": explanations,
+        }
+
+    def analyze_impact(
+        self,
+        target: str,
+        target_type: Optional[str] = None,
+        repo_path: Optional[str] = None,
+        depth: int = 3,
+        direction: str = "upstream",
+        max_wire_hops: int = 2,  # wire-bridging BFS depth, both directions (Tasks 7-8)
+    ) -> Dict[str, Any]:
+        """Analyze semantic code impact and propagation upstream or downstream."""
+        import subprocess
+        import shutil
+
+        depth = _sanitize_depth(depth, default=3)
+
+        if direction not in _IMPACT_DIRECTIONS:
+            return {
+                "target": {"name": target, "type": target_type or "Unknown", "path": ""},
+                "impact_score": 0.0,
+                "risk_level": "Low",
+                "warning": f"Invalid direction '{direction}'. Must be one of: {', '.join(_IMPACT_DIRECTIONS)}.",
+                "affected_nodes": [],
+                "propagation_paths": [],
+                "explanations": [],
+                "risk_breakdown": {
+                    "depth_score": 0.0,
+                    "module_score": 0.0,
+                    "criticality_score": 0.0,
+                    "churn_score": 0.0,
+                },
+                "direction": direction,
+                "cross_repo_hops": [],
+                "unresolved_crossings": [],
+            }
+
+        if direction == "both":
+            return self._analyze_impact_both(target, target_type, repo_path, depth, max_wire_hops)
+
+        # 1. Resolve repo root and target node(s)
+        repo_root, target_nodes = self._resolve_impact_target(target, repo_path)
 
         if not target_nodes:
             return {

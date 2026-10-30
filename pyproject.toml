@@ -127,6 +127,18 @@ ladybug = [
 neo4j = [
     "neo4j>=5.15.0",
 ]
+# Local embedding backend for the semantic search tier (search cascade tier
+# 3): fastembed's BGE-small ONNX model, no torch required (see
+# indexing/embeddings.py's _FastEmbedder). Verified 2026-10-29 in a clean
+# scratch venv: fastembed 0.9.1 (PyPI's current stable release) installs
+# and resolves cleanly alongside this project's `protobuf>=3.20,<3.21` pin
+# above -- pip's resolver backtracks to onnxruntime==1.26.0 rather than the
+# unconstrained-install default (onnxruntime>=1.27 pulls protobuf>=4.25.8,
+# which conflicts). `TextEmbedding(model_name="BAAI/bge-small-en-v1.5").
+# embed(["test"])` was confirmed to produce a real 384-dim vector.
+semantic-search = [
+    "fastembed>=0.9,<0.10",
+]
 gcf = [
     "gcf-python>=1.0.0",
 ]

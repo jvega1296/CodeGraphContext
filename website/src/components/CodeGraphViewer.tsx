@@ -383,6 +383,15 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   }), [rawData]);
 
   const fgRef = useRef<any>();
+  const autoFitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Debounced zoomToFit: coalesces rapid state changes (e.g. filter + data update firing together) into one call
+  const autoFitCamera = useCallback(() => {
+    if (autoFitTimeoutRef.current) clearTimeout(autoFitTimeoutRef.current);
+    autoFitTimeoutRef.current = setTimeout(() => {
+      fgRef.current?.zoomToFit(600, 100);
+    }, 50);
+  }, []);
+
   const [dimensions, setDimensions] = useState({ width: window.innerWidth, height: window.innerHeight });
   const [hoverNode, setHoverNode] = useState<any>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -760,6 +769,11 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   useEffect(() => {
     setSimulationReady(false);
   }, [filteredData]);
+
+  // When focus is cleared, zoom out to show the full visible graph
+  useEffect(() => {
+    if (focusSet === null) autoFitCamera();
+  }, [focusSet, autoFitCamera]);
 
   const nodeCanvasObject = useCallback((node: any, ctx: any, globalScale: number) => {
     if (!visibleNodeTypes.has(node.type)) return;
@@ -2786,8 +2800,10 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
               onNodeHover={setHoverNode}
               d3VelocityDecay={0.9}
               d3AlphaDecay={0.1}
+              // city3d uses pre-computed fixed positions; 0/0 skips physics entirely, onEngineStop fires immediately to fit the camera
               cooldownTicks={0}
               warmupTicks={0}
+              onEngineStop={autoFitCamera}
             />
             {/* Navigation controls overlay */}
             <div
@@ -2833,7 +2849,9 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
             onNodeHover={setHoverNode}
             d3VelocityDecay={0.4}
             d3AlphaDecay={0.05}
-            cooldownTicks={80}
+            // 3D simulation needs more ticks than 2D to settle (extra spatial dimension); 100 exceeds alpha-convergence threshold (~138 total with d3AlphaDecay=0.05)
+            cooldownTicks={100}
+            onEngineStop={() => { setSimulationReady(true); autoFitCamera(); }}
           />
         ) : graphMode === 'mermaid' ? (
           <FlowchartSVG
@@ -2847,7 +2865,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
         ) : (
           <ForceGraph2D
             ref={fgRef}
-            onEngineStop={() => setSimulationReady(true)}
+            onEngineStop={() => { setSimulationReady(true); autoFitCamera(); }}
             graphData={filteredData}
             width={dimensions.width - effectiveSidebarW - effectiveCodePanelW}
             height={dimensions.height}
@@ -2894,7 +2912,9 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
             onNodeHover={setHoverNode}
             d3VelocityDecay={0.4}
             d3AlphaDecay={0.05}
-            cooldownTicks={50}
+            // warmupTicks silently pre-computes 30 steps to skip the most chaotic scatter phase; cooldownTicks=120 gives D3 enough rendered frames (with alphaDecay=0.05, convergence needs ~138 total ticks)
+            warmupTicks={30}
+            cooldownTicks={120}
           />
         )}
 

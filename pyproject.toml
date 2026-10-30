@@ -142,6 +142,9 @@ semantic-search = [
 gcf = [
     "gcf-python>=1.0.0",
 ]
+vertex = [
+    "anthropic[vertex]>=0.40.0",
+]
 dev = [
     "pytest>=7.4.0",
     "black>=23.11.0",

@@ -9,6 +9,7 @@ from codegraphcontext.viz import server
 @pytest.fixture(autouse=True)
 def isolated_provider_keys(monkeypatch):
     for key in (
+        "ANTHROPIC_VERTEX_PROJECT_ID",
         "GEMINI_API_KEY",
         "OPENAI_API_KEY",
         "ATLASCLOUD_API_KEY",

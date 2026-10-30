@@ -359,18 +359,33 @@ async def get_graph(repo_path: Optional[str] = None, cypher_query: Optional[str]
         raise HTTPException(status_code=500, detail=str(e))
 
 def call_llm(system_prompt: str, user_prompt: str) -> str:
+    # Anthropic on Vertex AI — checked first; activated by ANTHROPIC_VERTEX_PROJECT_ID.
+    # The AnthropicVertex client reads ANTHROPIC_VERTEX_PROJECT_ID and CLOUD_ML_REGION
+    # from the environment automatically via GCP Application Default Credentials.
+    vertex_project = os.getenv("ANTHROPIC_VERTEX_PROJECT_ID")
     gemini_key = os.getenv("GEMINI_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
     atlascloud_key = os.getenv("ATLASCLOUD_API_KEY") or os.getenv("ATLAS_CLOUD_API_KEY")
     cheaperinference_key = os.getenv("CHEAPER_INFERENCE_API_KEY")
     api_route_key = os.getenv("API_ROUTE_API_KEY")
-    
-    if not gemini_key and not openai_key and not atlascloud_key and not cheaperinference_key and not api_route_key:
+
+    if not vertex_project and not gemini_key and not openai_key and not atlascloud_key and not cheaperinference_key and not api_route_key:
         raise ValueError(
-            "GEMINI_API_KEY, OPENAI_API_KEY, ATLASCLOUD_API_KEY, CHEAPER_INFERENCE_API_KEY, or API_ROUTE_API_KEY "
-            "environment variable is required."
+            "ANTHROPIC_VERTEX_PROJECT_ID, GEMINI_API_KEY, OPENAI_API_KEY, ATLASCLOUD_API_KEY, "
+            "CHEAPER_INFERENCE_API_KEY, or API_ROUTE_API_KEY environment variable is required."
         )
-    
+
+    if vertex_project:
+        from anthropic import AnthropicVertex
+        client = AnthropicVertex()
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8192,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return message.content[0].text
+
     if gemini_key:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
         payload = {
@@ -589,18 +604,19 @@ async def ai_query(request: AIQueryRequest):
     if not db_manager:
         raise HTTPException(status_code=500, detail="Database not initialized")
         
+    vertex_project = os.getenv("ANTHROPIC_VERTEX_PROJECT_ID")
     gemini_key = os.getenv("GEMINI_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
     atlascloud_key = os.getenv("ATLASCLOUD_API_KEY") or os.getenv("ATLAS_CLOUD_API_KEY")
     cheaperinference_key = os.getenv("CHEAPER_INFERENCE_API_KEY")
     api_route_key = os.getenv("API_ROUTE_API_KEY")
-    
-    if not gemini_key and not openai_key and not atlascloud_key and not cheaperinference_key and not api_route_key:
+
+    if not vertex_project and not gemini_key and not openai_key and not atlascloud_key and not cheaperinference_key and not api_route_key:
         raise HTTPException(
             status_code=400,
             detail=(
-                "AI querying requires GEMINI_API_KEY, OPENAI_API_KEY, ATLASCLOUD_API_KEY, "
-                "CHEAPER_INFERENCE_API_KEY, or API_ROUTE_API_KEY. "
+                "AI querying requires ANTHROPIC_VERTEX_PROJECT_ID, GEMINI_API_KEY, OPENAI_API_KEY, "
+                "ATLASCLOUD_API_KEY, CHEAPER_INFERENCE_API_KEY, or API_ROUTE_API_KEY. "
                 "Please set one in your configuration or .env."
             )
         )

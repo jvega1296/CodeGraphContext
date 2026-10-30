@@ -1,5 +1,6 @@
 import ForceGraph2D from "react-force-graph-2d";
 import ForceGraph3D from "react-force-graph-3d";
+import CodeGraphChatPanel from "./CodeGraphChatPanel";
 import RepositorySummary from "./RepositorySummary";
 import * as THREE from "three";
 import { useCallback, useRef, useState, useEffect, useMemo } from "react";
@@ -408,8 +409,16 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   const [focusSet, setFocusSet] = useState<{ nodes: Set<number>, links: Set<any> } | null>(null);
   const [simulationReady, setSimulationReady] = useState(false);
 
+  // Backend URL and repo_path from URL params (same pattern used by handleAIQuerySubmit)
+  const backendParam = useMemo(() => new URLSearchParams(window.location.search).get("backend") || "", []);
+  const repoPathParam = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    return data.metadata?.path || params.get("repo_path") || null;
+  }, [data.metadata?.path]);
+
   // AI query exploration states
   const [isAIMode, setIsAIMode] = useState(false);
+  const [showChatPanel, setShowChatPanel] = useState(false);
   const [aiQuery, setAiQuery] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [aiResponse, setAiResponse] = useState<any | null>(null);
@@ -1780,6 +1789,10 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     }
   }, [aiQuery, data, highlightAIQueryResultNodes, llmConfig]);
 
+  const handleChatPanelGraphResult = useCallback((resData: any) => {
+    highlightAIQueryResultNodes(resData);
+  }, [highlightAIQueryResultNodes]);
+
   const getLinkColor = useCallback((link: any) => {
     const isFocused = focusSet ? focusSet.links.has(link) : true;
     const baseColor = edgeColors[link.type] || '#ffffff';
@@ -2505,16 +2518,17 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
               Publish
             </button>
 
-            {/* ChatGPT Tunnel Button */}
-            <button
-              onClick={handleConnectChatGPT}
-              className={`flex items-center gap-2 text-[11px] uppercase tracking-widest font-bold px-4 py-2 border rounded-full transition-all backdrop-blur-md shadow-2xl cursor-pointer ${isDark ? 'bg-black/40 hover:bg-purple-500/20 text-white border-white/10' : 'bg-white/80 hover:bg-white text-gray-800 border-black/10'}`}
-              title="Open the CGC ChatGPT GPT. Keep this cgc.codes tab focused (not behind ChatGPT) so the signaling tunnel stays online."
-            >
-              <div className="w-2 h-2 rounded-full bg-amber-500/80 shadow-[0_0_6px_#f59e0b]" title="Tunnel status is not shown here — keep this tab active while using ChatGPT" />
-              <MessageSquare className="w-3.5 h-3.5 text-purple-400" />
-              ChatGPT
-            </button>
+            {/* Ask Claude — native chat panel, only shown when a backend is configured */}
+            {backendParam && (
+              <button
+                onClick={() => setShowChatPanel(v => !v)}
+                className={`flex items-center gap-2 text-[11px] uppercase tracking-widest font-bold px-4 py-2 border rounded-full transition-all backdrop-blur-md shadow-2xl cursor-pointer ${showChatPanel ? 'bg-purple-500/20 text-purple-300 border-purple-500/30' : isDark ? 'bg-black/40 hover:bg-purple-500/20 text-white border-white/10' : 'bg-white/80 hover:bg-white text-gray-800 border-black/10'}`}
+                title="Ask Claude about this graph"
+              >
+                <MessageSquare className="w-3.5 h-3.5 text-purple-400" />
+                Ask Claude
+              </button>
+            )}
 
             {/* Mode Selector Dropdown */}
             <div ref={modeMenuRef} className="relative">
@@ -2691,6 +2705,39 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
             )}
           </AnimatePresence>
         </div>
+
+        {/* ── Claude Chat Panel (bottom-right, only when backend is configured) ── */}
+        <AnimatePresence>
+          {backendParam && showChatPanel && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 8 }}
+              transition={{ duration: 0.18 }}
+              className="absolute bottom-6 right-6 z-[65] w-[400px] max-w-[calc(100vw-80px)]"
+            >
+              <div className={`flex items-center justify-between mb-1.5 px-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                <span className="text-[10px] font-black uppercase tracking-widest flex items-center gap-1.5">
+                  <MessageSquare className="w-3 h-3 text-purple-400" />
+                  Ask Claude about this graph
+                </span>
+                <button
+                  onClick={() => setShowChatPanel(false)}
+                  className="p-0.5 rounded hover:text-white transition-colors"
+                  title="Close"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+              <CodeGraphChatPanel
+                backendUrl={backendParam}
+                repoPath={repoPathParam}
+                isDark={isDark}
+                onGraphResult={handleChatPanelGraphResult}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Zoom Controls */}
         <div className="absolute top-6 left-6 z-[60] flex flex-col gap-4">

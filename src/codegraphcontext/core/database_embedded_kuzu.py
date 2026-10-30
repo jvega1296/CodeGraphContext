@@ -325,7 +325,10 @@ class EmbeddedGraphManager(GraphQueryInterface):
             # DbColumn/RedisKeyPattern above -- these are keyed on a
             # synthesized uid (see self.uid_map below).
             ("Topic", "uid STRING, system STRING, name STRING, PRIMARY KEY (uid)"),
-            ("Subscription", "uid STRING, name STRING, project_id STRING, PRIMARY KEY (uid)")
+            # service_account is backfilled later by Piece 3's Terraform
+            # stitching step (terraform_stitcher.py) -- never known from
+            # application code alone, so it is not part of the natural key.
+            ("Subscription", "uid STRING, name STRING, project_id STRING, service_account STRING, PRIMARY KEY (uid)")
         ]
         
         # rel_tables: list of (table_name, schema, use_group)
@@ -1213,7 +1216,7 @@ class EmbeddedSessionWrapper:
             'Extension': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'is_dependency'},
             'Object': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'is_dependency', 'decorators', 'visibility', 'modifiers'},
             'Topic': {'uid', 'system', 'name'},
-            'Subscription': {'uid', 'name', 'project_id'},
+            'Subscription': {'uid', 'name', 'project_id', 'service_account'},
         }
 
         # 1. Translate SET n += $props  and  SET n = $props  (map merge/assign)

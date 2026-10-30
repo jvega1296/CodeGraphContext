@@ -132,9 +132,28 @@ def test_stitch_topics_to_terraform_matches_by_topic_name():
 
 
 def test_stitch_subscriptions_to_terraform_matches_by_service_account():
+    """The Subscription<-BACKED_BY-Terraform match itself is name-only (see
+    _MATCH_SUBSCRIPTION_BACKED_BY's own comment on why), but this is the
+    exact reason Decision #1 added a first-class Subscription node: once
+    matched, the module's service_account -- the signal the application-code
+    scan could never see -- must actually be backfilled onto the node, not
+    just read and discarded. Asserting only subscriptions_backed == 1 would
+    pass identically whether or not service_account were read, passed, or
+    used at all -- so this asserts the SET query actually carried it."""
     driver = fake_driver_with_subscription_and_pull_subscriptions_json()
     stats = stitch_topics_to_terraform(driver)
     assert stats.subscriptions_backed == 1
+
+    backed_by_queries = [
+        c for c in driver.calls["queries"]
+        if "MERGE (s)-[:BACKED_BY]->(c)" in c["query"]
+    ]
+    assert len(backed_by_queries) == 1
+    assert "SET s.service_account" in backed_by_queries[0]["query"]
+    assert (
+        backed_by_queries[0]["params"]["service_account"]
+        == "svc@proj.iam.gserviceaccount.com"
+    )
 
 
 def test_unmatched_topics_are_reported_not_silently_dropped():

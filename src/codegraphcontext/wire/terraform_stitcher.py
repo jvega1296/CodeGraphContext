@@ -73,9 +73,22 @@ RETURN c.uid as uid, c.topic as topic, c.pull_subscriptions as pull_subscription
 # real GCP project. Matching on name only here finds that same node rather
 # than risking a second, differently-keyed Subscription node if a real
 # project_id were used instead.
+#
+# Once matched, this also backfills service_account onto the Subscription
+# node from the same pull_subscriptions entry -- this is new data the
+# application-code scan could never have provided (see writer.py's
+# _UNKNOWN_PROJECT_ID comment: "Piece 3's Terraform stitching step backfills
+# ... later"), and the whole reason Decision #1 in the design spec added a
+# first-class Subscription node was to let this step attach Terraform's
+# "most reliable signal for who consumes this" to it. Deriving a real
+# project_id from the service_account email (e.g. the project-id segment of
+# name@project-id.iam.gserviceaccount.com) is deliberately NOT done here --
+# that's unverified inference with no specified format, left for a later
+# decision; project_id stays at its existing "unknown" placeholder.
 _MATCH_SUBSCRIPTION_BACKED_BY = """
 MATCH (s:Subscription {name: $subscription_name}), (c:Class {uid: $class_uid})
 MERGE (s)-[:BACKED_BY]->(c)
+SET s.service_account = $service_account
 RETURN count(*) as matched
 """
 
@@ -146,12 +159,19 @@ def stitch_topics_to_terraform(driver: Any, *, graph_name: Optional[str] = None)
             subscription_name = entry.get("name") if isinstance(entry, dict) else None
             if not subscription_name:
                 continue
+            service_account = entry.get("service_account") if isinstance(entry, dict) else None
 
-            def _backed_by(session, subscription_name=subscription_name, class_uid=class_uid):
+            def _backed_by(
+                session,
+                subscription_name=subscription_name,
+                class_uid=class_uid,
+                service_account=service_account,
+            ):
                 result = session.run(
                     _MATCH_SUBSCRIPTION_BACKED_BY,
                     subscription_name=subscription_name,
                     class_uid=class_uid,
+                    service_account=service_account,
                 )
                 record = result.single()
                 return record["matched"] if record else 0

@@ -1,4 +1,5 @@
 # src/codegraphcontext/tools/handlers/analysis_handlers.py
+from dataclasses import asdict
 from typing import Any, Dict
 from ..code_finder import CodeFinder
 from ...utils.debug_log import debug_log
@@ -376,3 +377,26 @@ def analyze_impact(code_finder: CodeFinder, **args) -> Dict[str, Any]:
     except Exception as e:
         debug_log(f"Error analyzing impact: {str(e)}")
         return {"error": f"Failed to analyze impact: {str(e)}"}
+
+
+def stitch_infrastructure(code_finder: CodeFinder, **args) -> Dict[str, Any]:
+    """Tool to connect wire-coupling Topic/Subscription nodes to the
+    Terraform resources that define them (Piece 3, Task 12).
+
+    Conceptually adjacent to analyze_impact: both are post-indexing
+    graph-enrichment operations keyed off code_finder.db_manager rather than
+    GraphBuilder/JobManager, which is why this lives here rather than in
+    management_handlers.py (repo/job/registry lifecycle) or a new module.
+    """
+    from ...wire.terraform_stitcher import stitch_topics_to_terraform
+
+    graph_name = args.get("graph_name")
+
+    try:
+        debug_log(f"Stitching infrastructure. graph_name={graph_name}")
+        driver = code_finder.db_manager.get_driver(graph_name)
+        stats = stitch_topics_to_terraform(driver, graph_name=graph_name)
+        return {"success": True, "stats": asdict(stats)}
+    except Exception as e:
+        debug_log(f"Error stitching infrastructure: {str(e)}")
+        return {"error": f"Failed to stitch infrastructure: {str(e)}"}

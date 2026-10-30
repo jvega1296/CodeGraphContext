@@ -120,6 +120,11 @@ class _FakeSession:
                         "consumer_uid": "func_on_order_create",
                         "consumer_name": "onOrderCreateEvent",
                         "consumer_path": "src/oms-order-consumer/OrderCreateListener.java",
+                        # Task 12's BACKED_BY stitching: the Topic this crossing
+                        # goes through is backed by a Terraform module node.
+                        "terraform_uid": "class_terra_pubsub_module",
+                        "terraform_name": "module.oms_order_create_pubsub",
+                        "terraform_path": "terra-projects-oms/pubsub.tf",
                     }
                 ])
             return _FakeResult([])
@@ -279,7 +284,6 @@ def test_analyze_impact_both_returns_one_merged_connected_trace_not_two_lists():
     for e in res["edges"]:
         assert e["source_uid"] in node_uids and e["target_uid"] in node_uids
 
-@pytest.mark.skip(reason="requires Task 12's BACKED_BY edge in the bridging query -- un-skip when Piece 3 lands")
 def test_analyze_impact_both_on_create_order_includes_consumer_repo_and_terraform_node():
     finder, recorder = _make_finder()
     res = finder.analyze_impact(target="createOrder", direction="both", max_wire_hops=2)

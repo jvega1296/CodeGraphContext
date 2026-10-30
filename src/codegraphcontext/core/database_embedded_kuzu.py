@@ -319,7 +319,13 @@ class EmbeddedGraphManager(GraphQueryInterface):
             # embedded backends. Composite natural keys use a synthesized uid.
             ("GradleModule", "name STRING, build_file STRING, path STRING, repo_path STRING, PRIMARY KEY (name)"),
             ("MavenModule", "uid STRING, group_id STRING, artifact_id STRING, version STRING, packaging STRING, pom_path STRING, path STRING, repo_path STRING, PRIMARY KEY (uid)"),
-            ("ExternalLibrary", "uid STRING, group_id STRING, artifact_id STRING, version STRING, PRIMARY KEY (uid)")
+            ("ExternalLibrary", "uid STRING, group_id STRING, artifact_id STRING, version STRING, PRIMARY KEY (uid)"),
+            # Wire-coupling entities (MULTI_REPO_LINKS, Piece 1/3): composite
+            # natural keys (system+name, name+project_id), so -- like
+            # DbColumn/RedisKeyPattern above -- these are keyed on a
+            # synthesized uid (see self.uid_map below).
+            ("Topic", "uid STRING, system STRING, name STRING, PRIMARY KEY (uid)"),
+            ("Subscription", "uid STRING, name STRING, project_id STRING, PRIMARY KEY (uid)")
         ]
         
         # rel_tables: list of (table_name, schema, use_group)
@@ -422,6 +428,9 @@ class EmbeddedGraphManager(GraphQueryInterface):
             ("WRITES", "FROM Function TO DbTable, line_number INT64", False),
             ("STORED_IN", "FROM DbTable TO Datasource, FROM RedisKeyPattern TO Datasource", True),
             ("HAS_COLUMN", "FROM DbTable TO DbColumn", False),
+            # Wire-coupling edges (MULTI_REPO_LINKS, Piece 1/3).
+            ("HAS_SUBSCRIPTION", "FROM Topic TO Subscription", False),
+            ("BACKED_BY", "FROM Topic TO Class, FROM Subscription TO Class", True),
         ]
 
         # Legacy Kùzu databases may carry a DbTable created with PRIMARY KEY
@@ -800,7 +809,9 @@ class EmbeddedSessionWrapper:
             'DbColumn': ['name', 'table_fqn'],
             'RedisKeyPattern': ['pattern', 'datasource_name'],
             'MavenModule': ['group_id', 'artifact_id'],
-            'ExternalLibrary': ['group_id', 'artifact_id']
+            'ExternalLibrary': ['group_id', 'artifact_id'],
+            'Topic': ['system', 'name'],
+            'Subscription': ['name', 'project_id'],
         }
     
     def __enter__(self):
@@ -1200,7 +1211,9 @@ class EmbeddedSessionWrapper:
             'Parameter': {'uid', 'name', 'path', 'function_line_number'},
             'Mixin': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'is_dependency'},
             'Extension': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'is_dependency'},
-            'Object': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'is_dependency', 'decorators', 'visibility', 'modifiers'}
+            'Object': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'is_dependency', 'decorators', 'visibility', 'modifiers'},
+            'Topic': {'uid', 'system', 'name'},
+            'Subscription': {'uid', 'name', 'project_id'},
         }
 
         # 1. Translate SET n += $props  and  SET n = $props  (map merge/assign)

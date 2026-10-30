@@ -262,15 +262,19 @@ def _criticality_query(direction: str) -> str:
 _BRIDGE_PRODUCER_TO_SUBSCRIPTION_CONSUMER = """
     MATCH (fn)-[:PRODUCES_TO]->(t:Topic)-[:HAS_SUBSCRIPTION]->(s:Subscription)<-[:CONSUMES_FROM]-(consumer_fn)
     WHERE fn.uid IN $frontier_uids
+    OPTIONAL MATCH (t)-[:BACKED_BY]->(tf:Class)
     RETURN fn.uid as producer_uid, t.name as topic_name, s.name as subscription_name,
-           consumer_fn.uid as consumer_uid, consumer_fn.name as consumer_name, consumer_fn.path as consumer_path
+           consumer_fn.uid as consumer_uid, consumer_fn.name as consumer_name, consumer_fn.path as consumer_path,
+           tf.uid as terraform_uid, tf.name as terraform_name, tf.path as terraform_path
 """
 
 _BRIDGE_PRODUCER_TO_TOPIC_CONSUMER = """
     MATCH (fn)-[:PRODUCES_TO]->(t:Topic)<-[:CONSUMES_FROM]-(consumer_fn)
     WHERE fn.uid IN $frontier_uids AND NOT (t)-[:HAS_SUBSCRIPTION]->()
+    OPTIONAL MATCH (t)-[:BACKED_BY]->(tf:Class)
     RETURN fn.uid as producer_uid, t.name as topic_name, null as subscription_name,
-           consumer_fn.uid as consumer_uid, consumer_fn.name as consumer_name, consumer_fn.path as consumer_path
+           consumer_fn.uid as consumer_uid, consumer_fn.name as consumer_name, consumer_fn.path as consumer_path,
+           tf.uid as terraform_uid, tf.name as terraform_name, tf.path as terraform_path
 """
 
 # Column names deliberately reuse A/B's shape (producer_uid/topic_name/
@@ -320,15 +324,19 @@ _BRIDGE_DEAD_END_TOPIC = """
 _BRIDGE_CONSUMER_TO_SUBSCRIPTION_PRODUCER = """
     MATCH (consumer_fn)-[:CONSUMES_FROM]->(s:Subscription)<-[:HAS_SUBSCRIPTION]-(t:Topic)<-[:PRODUCES_TO]-(fn)
     WHERE consumer_fn.uid IN $frontier_uids
+    OPTIONAL MATCH (t)-[:BACKED_BY]->(tf:Class)
     RETURN consumer_fn.uid as producer_uid, t.name as topic_name, s.name as subscription_name,
-           fn.uid as consumer_uid, fn.name as consumer_name, fn.path as consumer_path
+           fn.uid as consumer_uid, fn.name as consumer_name, fn.path as consumer_path,
+           tf.uid as terraform_uid, tf.name as terraform_name, tf.path as terraform_path
 """
 
 _BRIDGE_CONSUMER_TO_TOPIC_PRODUCER = """
     MATCH (consumer_fn)-[:CONSUMES_FROM]->(t:Topic)<-[:PRODUCES_TO]-(fn)
     WHERE consumer_fn.uid IN $frontier_uids AND NOT (t)-[:HAS_SUBSCRIPTION]->()
+    OPTIONAL MATCH (t)-[:BACKED_BY]->(tf:Class)
     RETURN consumer_fn.uid as producer_uid, t.name as topic_name, null as subscription_name,
-           fn.uid as consumer_uid, fn.name as consumer_name, fn.path as consumer_path
+           fn.uid as consumer_uid, fn.name as consumer_name, fn.path as consumer_path,
+           tf.uid as terraform_uid, tf.name as terraform_name, tf.path as terraform_path
 """
 
 _BRIDGE_ENDPOINT_INVOKES_SERVES = """
@@ -2649,6 +2657,23 @@ class CodeFinder:
                                 "path": fragment.get("consumer_path"),
                                 "depth": 0,
                             }
+                        # Terraform node backing this crossing's Topic (Task
+                        # 12's BACKED_BY stitching) -- present only once the
+                        # infrastructure repo has been indexed and
+                        # stitch_infrastructure has run. Added as its own
+                        # affected node (depth 0, same rationale as the wire
+                        # crossing above) rather than folded into the
+                        # function-shaped cross_repo_hops fragment, since it
+                        # is a Class node, not a Function.
+                        terraform_uid = fragment.get("terraform_uid")
+                        if terraform_uid and terraform_uid not in affected_nodes_map:
+                            affected_nodes_map[terraform_uid] = {
+                                "uid": terraform_uid,
+                                "name": fragment.get("terraform_name"),
+                                "type": "Class",
+                                "path": fragment.get("terraform_path"),
+                                "depth": 0,
+                            }
 
                     res_hop = session.run(propagation_query, target_uids=newly_discovered_uids)
                     hop_leaf_uids = _apply_propagation_rows(res_hop)
@@ -2690,6 +2715,17 @@ class CodeFinder:
                                 "name": fragment.get("consumer_name"),
                                 "type": "Function",
                                 "path": fragment.get("consumer_path"),
+                                "depth": 0,
+                            }
+                        # see the matching comment in the downstream block
+                        # above -- Terraform node backing this crossing's Topic.
+                        terraform_uid = fragment.get("terraform_uid")
+                        if terraform_uid and terraform_uid not in affected_nodes_map:
+                            affected_nodes_map[terraform_uid] = {
+                                "uid": terraform_uid,
+                                "name": fragment.get("terraform_name"),
+                                "type": "Class",
+                                "path": fragment.get("terraform_path"),
                                 "depth": 0,
                             }
 

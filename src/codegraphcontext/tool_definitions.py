@@ -584,5 +584,15 @@ TOOLS = {
             },
             "required": ["target"]
         }
+    },
+    "stitch_infrastructure": {
+        "name": "stitch_infrastructure",
+        "description": "Connect wire-coupling Topic/Subscription nodes to the real Terraform resources that define them. Run once after indexing both the code repos and the infrastructure (Terraform) repo.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "graph_name": _GRAPH_NAME_PROP
+            }
+        }
     }
 }

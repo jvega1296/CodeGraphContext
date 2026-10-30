@@ -94,7 +94,11 @@ const DEFAULT_NODE_COLORS: Record<string, string> = {
   Property: '#dce775',
   Annotation: '#ec407a',
   Parameter: '#90a4ae',
-  Other: '#78909c'
+  Other: '#78909c',
+  // Infrastructure / wire-coupling nodes — visually distinct from code-structure palette
+  Topic: '#e879f9',
+  Subscription: '#22d3ee',
+  Endpoint: '#bef264',
 };
 
 const DEFAULT_EDGE_COLORS: Record<string, string> = {
@@ -104,7 +108,14 @@ const DEFAULT_EDGE_COLORS: Record<string, string> = {
   INHERITS: '#66bb6a',
   IMPLEMENTS: '#26a69a',
   INCLUDES: '#81c784',
-  HAS_PARAMETER: '#ffca28'
+  HAS_PARAMETER: '#ffca28',
+  // Infrastructure / wire-coupling edges — bright family, reads as different category from code-structure edges
+  PRODUCES_TO: '#f97316',
+  CONSUMES_FROM: '#06b6d4',
+  SERVES: '#84cc16',
+  INVOKES: '#fb923c',
+  BACKED_BY: '#f43f5e',
+  HAS_SUBSCRIPTION: '#a78bfa',
 };
 
 // ─── Visualization Modes ─────────────────────────────────────────────────────
@@ -126,6 +137,8 @@ const EMOJI_MAP: Record<string, string> = {
   Class: '🏛️', Struct: '🧊', Interface: '🔌', Trait: '🧬',
   Enum: '🔢', Annotation: '🏷️', Function: '⚙️',
   Macro: '🔧', Record: '📋', Union: '🔗', Property: '🏠',
+  // Infrastructure nodes
+  Topic: '📡', Subscription: '🔔', Endpoint: '🎯',
 };
 
 // Above this node count, main-thread d3-force simulation causes visible jank on real cross-repo graphs;
@@ -206,6 +219,8 @@ const CITY_HEIGHTS: Record<string, number> = {
   Class: 14, Interface: 12, Trait: 12, Struct: 13, Enum: 10,
   Function: 7, Module: 6, File: 2.5, Variable: 2, Annotation: 3,
   Parameter: 1.5, Other: 4, Repository: 0, Directory: 0,
+  // Infrastructure nodes — prominent, reflect structural significance
+  Endpoint: 12, Topic: 11, Subscription: 9,
 };
 
 const CITY_ARC_SEGMENTS = 24;

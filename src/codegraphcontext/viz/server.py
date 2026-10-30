@@ -384,7 +384,10 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        return message.content[0].text
+        try:
+            return message.content[0].text
+        except (IndexError, AttributeError) as e:
+            raise RuntimeError(f"Unexpected Vertex AI response shape: {message.content}") from e
 
     if gemini_key:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"

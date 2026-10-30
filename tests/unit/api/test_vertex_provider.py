@@ -144,6 +144,55 @@ def test_vertex_takes_priority_over_openai(monkeypatch):
     mock_requests.post.assert_not_called()
 
 
+def test_vertex_takes_priority_over_api_route(monkeypatch):
+    """When both ANTHROPIC_VERTEX_PROJECT_ID and API_ROUTE_API_KEY are set, Vertex wins."""
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "proj")
+    monkeypatch.setenv("API_ROUTE_API_KEY", "api-route-key")
+
+    with _mock_anthropic() as mock_anthropic, \
+         patch("codegraphcontext.viz.server.requests") as mock_requests:
+        mock_client = MagicMock()
+        mock_anthropic.AnthropicVertex.return_value = mock_client
+        mock_client.messages.create.return_value.content = [MagicMock(text="vertex response")]
+
+        result = server.call_llm("sys", "usr")
+
+    assert result == "vertex response"
+    mock_requests.post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Error handling — malformed / filtered Vertex responses
+# ---------------------------------------------------------------------------
+
+def test_vertex_empty_content_raises_runtime_error(monkeypatch):
+    """An empty content list (e.g. filtered/blocked) raises RuntimeError, not IndexError."""
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "proj")
+
+    with _mock_anthropic() as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.AnthropicVertex.return_value = mock_client
+        mock_client.messages.create.return_value.content = []  # empty — no candidates
+
+        with pytest.raises(RuntimeError, match="Unexpected Vertex AI response shape"):
+            server.call_llm("sys", "usr")
+
+
+def test_vertex_content_block_missing_text_raises_runtime_error(monkeypatch):
+    """A content block without a .text attribute raises RuntimeError, not AttributeError."""
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "proj")
+
+    malformed_block = MagicMock(spec=[])  # no attributes at all
+
+    with _mock_anthropic() as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.AnthropicVertex.return_value = mock_client
+        mock_client.messages.create.return_value.content = [malformed_block]
+
+        with pytest.raises(RuntimeError, match="Unexpected Vertex AI response shape"):
+            server.call_llm("sys", "usr")
+
+
 # ---------------------------------------------------------------------------
 # Existing provider chain is unchanged when ANTHROPIC_VERTEX_PROJECT_ID is absent
 # ---------------------------------------------------------------------------

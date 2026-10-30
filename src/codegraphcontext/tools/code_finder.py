@@ -2254,11 +2254,19 @@ class CodeFinder:
 
         target_nodes: List[Dict[str, Any]] = []
         with self.driver.session() as session:
-            # Check if target matches a file path
+            # Check if target matches a file path. File's identity is its
+            # path (PK_MAP['File'] = 'path' on the embedded backends -- File
+            # has no synthesized uid column); on Neo4j/FalkorDB f.uid was
+            # always None (schemaless property-miss, never an error), but
+            # Kuzu/LadybugDB's strict DDL throws "Binder exception: Cannot
+            # find property uid for f" for referencing an undeclared column
+            # at all, regardless of whether any row matches. Using f.path as
+            # this function's internal "uid" slot for File rows matches how
+            # every other File reference in this codebase identifies it.
             file_query = """
                 MATCH (f:File)
                 WHERE f.path = $target OR f.path ENDS WITH $target
-                RETURN f.uid as uid, f.name as name, f.path as path, 'File' as type
+                RETURN f.path as uid, f.name as name, f.path as path, 'File' as type
             """
             res_file = session.run(file_query, target=target)
             file_nodes = res_file.data()
@@ -2269,7 +2277,7 @@ class CodeFinder:
                 # Get all entities defined inside the file
                 contains_query = """
                     MATCH (f:File)-[:CONTAINS*1..2]->(c)
-                    WHERE f.uid = $uid
+                    WHERE f.path = $uid
                       AND (c:Function OR c:Class OR c:Module OR c:Interface OR c:Struct OR c:Enum OR c:Record OR c:Mixin OR c:Extension OR c:Object OR c:Variable)
                     RETURN c.uid as uid, c.name as name, c.path as path, labels(c) as labels
                 """

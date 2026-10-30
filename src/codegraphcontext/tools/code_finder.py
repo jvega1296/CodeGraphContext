@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from ..core.database import DatabaseManager
 from ..utils.path_ignore import cypher_path_not_under_ignore_dirs
 from ..utils.tool_limits import get_tool_result_limit
+from . import risk_scoring
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +248,19 @@ def _criticality_query(direction: str) -> str:
         MATCH (target)<-[r:{_IMPACT_REL_TYPES}]-()
         WHERE target.uid IN $target_uids
         RETURN count(r) as count
+    """
+
+
+def _caller_paths_query() -> str:
+    """Caller file paths for analyze_impact's ported community-crossing risk
+    factor (Task 16). Same direction and relationship types as
+    ``_criticality_query("upstream")`` (callers pointing into the target),
+    but returning each caller's file path instead of a count.
+    """
+    return f"""
+        MATCH (c)-[r:{_IMPACT_REL_TYPES}]->(target)
+        WHERE target.uid IN $target_uids
+        RETURN c.path as path
     """
 
 
@@ -2296,6 +2310,70 @@ class CodeFinder:
                 })
         return nodes
 
+    def _compute_ported_risk_score(
+        self,
+        target_nodes: List[Dict[str, Any]],
+        in_degree: int,
+        repo_root: Optional[str],
+        include_churn: bool,
+    ) -> Tuple[float, Dict[str, float], str]:
+        """Port of code-review-graph's ``compute_risk_score`` (changes.py
+        lines 581-647) for analyze_impact's primary target: 5 of its 6
+        weighted factors, summed, clamped to [0.0, 1.0] and rounded to 4
+        decimals -- exactly as the original's final line does.
+
+        Only 5 of 6: code-review-graph's flow-participation factor (0.05 per
+        flow membership, capped at 0.25 -- the single largest weight in its
+        formula) is intentionally omitted here. It requires real
+        flow/execution-path detection, which nothing in CGC builds today;
+        building even a lightweight version is new multi-step analysis work,
+        correctly deferred as its own follow-on project rather than attempted
+        in this task. A future reader comparing this ``risk_score`` against
+        code-review-graph's ``compute_risk_score`` on the same function
+        should not expect the two numbers to match even though both are on a
+        0.0-1.0 scale -- this one is missing up to 0.25 of the other
+        formula's total weight.
+
+        Shared by both of analyze_impact's return blocks (single-direction
+        and direction="both") so this five-factor computation lives in one
+        place rather than being duplicated. ``in_degree``/``repo_root``/
+        ``target_nodes`` are passed in rather than re-resolved here, since
+        each caller already has them in scope.
+        """
+        primary = target_nodes[0]
+        name = primary.get("name") or ""
+        target_path = primary.get("path") or ""
+        # target_nodes (see _resolve_impact_target) carries no qualified_name
+        # -- the file path is the closest available proxy and still carries
+        # useful signal (e.g. "src/auth/..." matches the "auth" keyword).
+        qualified_name = target_path
+
+        target_uids = [n["uid"] for n in target_nodes]
+        with self.driver.session() as session:
+            res_callers = session.run(_caller_paths_query(), target_uids=target_uids)
+            caller_paths = [row["path"] for row in res_callers if row.get("path")]
+            test_count = risk_scoring.find_test_coverage_count(session, name, target_path)
+
+        if not include_churn:
+            churn_status = risk_scoring.CHURN_OFF
+            churn_term = 0.0
+        elif not repo_root:
+            churn_status = risk_scoring.CHURN_UNAVAILABLE
+            churn_term = 0.0
+        else:
+            churn_counts, churn_status = risk_scoring.compute_file_churn_with_status(repo_root)
+            churn_term = risk_scoring.churn_score(churn_counts.get(target_path, 0))
+
+        risk_factors = {
+            "security_sensitivity": risk_scoring.security_sensitivity_score(name, qualified_name),
+            "caller_count": risk_scoring.caller_count_score(in_degree),
+            "community_crossing": risk_scoring.community_crossing_score(target_path, caller_paths),
+            "test_coverage": risk_scoring.test_coverage_score(test_count),
+            "churn": churn_term,
+        }
+        risk_score = round(min(max(sum(risk_factors.values()), 0.0), 1.0), 4)
+        return risk_score, risk_factors, churn_status
+
     def _analyze_impact_both(
         self,
         target: str,
@@ -2303,6 +2381,7 @@ class CodeFinder:
         repo_path: Optional[str],
         depth: int,
         max_wire_hops: int,
+        include_churn: bool = True,
     ) -> Dict[str, Any]:
         """direction="both": run the upstream and downstream single-direction
         traces (Task 6/7/8's already-reviewed logic, called exactly as any
@@ -2313,7 +2392,7 @@ class CodeFinder:
         from both directions -- not as two separately-clamped per-direction
         scores averaged or summed.
         """
-        _repo_root, target_nodes = self._resolve_impact_target(target, repo_path)
+        repo_root, target_nodes = self._resolve_impact_target(target, repo_path)
 
         if not target_nodes:
             return {
@@ -2331,6 +2410,15 @@ class CodeFinder:
                     "criticality_score": 0.0,
                     "churn_score": 0.0,
                 },
+                "risk_score": 0.0,
+                "risk_factors": {
+                    "security_sensitivity": 0.0,
+                    "caller_count": 0.0,
+                    "community_crossing": 0.0,
+                    "test_coverage": 0.0,
+                    "churn": 0.0,
+                },
+                "churn_status": risk_scoring.CHURN_OFF,
                 "explanations": [],
                 "warning": f"No code symbol or file named '{target}' was found in the graph.",
             }
@@ -2338,10 +2426,12 @@ class CodeFinder:
         downstream_result = self.analyze_impact(
             target=target, target_type=target_type, repo_path=repo_path,
             depth=depth, direction="downstream", max_wire_hops=max_wire_hops,
+            include_churn=include_churn,
         )
         upstream_result = self.analyze_impact(
             target=target, target_type=target_type, repo_path=repo_path,
             depth=depth, direction="upstream", max_wire_hops=max_wire_hops,
+            include_churn=include_churn,
         )
 
         # --- nodes: dict keyed by uid, role-tagged. Target seeded first so
@@ -2479,6 +2569,15 @@ class CodeFinder:
         else:
             risk_level = "Low"
 
+        # Ported risk-score factors (Task 16): computed once over the merged
+        # target, using the true caller in-degree (upstream direction) --
+        # unlike criticality_score above, this does not combine in/out
+        # degree, since "caller count" is specifically about who calls into
+        # the target, regardless of direction="both" also tracing outward.
+        risk_score, risk_factors, churn_status = self._compute_ported_risk_score(
+            target_nodes, in_degree, repo_root, include_churn,
+        )
+
         return {
             "target": downstream_result["target"],
             "direction": "both",
@@ -2494,6 +2593,9 @@ class CodeFinder:
                 "criticality_score": round(criticality_score, 2),
                 "churn_score": round(churn_score, 2),
             },
+            "risk_score": risk_score,
+            "risk_factors": risk_factors,
+            "churn_status": churn_status,
             "explanations": explanations,
         }
 
@@ -2505,6 +2607,7 @@ class CodeFinder:
         depth: int = 3,
         direction: str = "upstream",
         max_wire_hops: int = 2,  # wire-bridging BFS depth, both directions (Tasks 7-8)
+        include_churn: bool = True,  # Task 16's ported churn factor shells out to git; togglable
     ) -> Dict[str, Any]:
         """Analyze semantic code impact and propagation upstream or downstream."""
         import subprocess
@@ -2527,13 +2630,24 @@ class CodeFinder:
                     "criticality_score": 0.0,
                     "churn_score": 0.0,
                 },
+                "risk_score": 0.0,
+                "risk_factors": {
+                    "security_sensitivity": 0.0,
+                    "caller_count": 0.0,
+                    "community_crossing": 0.0,
+                    "test_coverage": 0.0,
+                    "churn": 0.0,
+                },
+                "churn_status": risk_scoring.CHURN_OFF,
                 "direction": direction,
                 "cross_repo_hops": [],
                 "unresolved_crossings": [],
             }
 
         if direction == "both":
-            return self._analyze_impact_both(target, target_type, repo_path, depth, max_wire_hops)
+            return self._analyze_impact_both(
+                target, target_type, repo_path, depth, max_wire_hops, include_churn,
+            )
 
         # 1. Resolve repo root and target node(s)
         repo_root, target_nodes = self._resolve_impact_target(target, repo_path)
@@ -2553,6 +2667,15 @@ class CodeFinder:
                     "criticality_score": 0.0,
                     "churn_score": 0.0,
                 },
+                "risk_score": 0.0,
+                "risk_factors": {
+                    "security_sensitivity": 0.0,
+                    "caller_count": 0.0,
+                    "community_crossing": 0.0,
+                    "test_coverage": 0.0,
+                    "churn": 0.0,
+                },
+                "churn_status": risk_scoring.CHURN_OFF,
                 "direction": direction,
                 "cross_repo_hops": [],
                 "unresolved_crossings": [],
@@ -2839,6 +2962,13 @@ class CodeFinder:
             "path": target_nodes[0]["path"],
         }
 
+        # Ported risk-score factors (Task 16), alongside the existing
+        # impact_score/risk_level/risk_breakdown above -- both scoring
+        # systems coexist rather than one replacing the other.
+        risk_score, risk_factors, churn_status = self._compute_ported_risk_score(
+            target_nodes, in_degree, repo_root, include_churn,
+        )
+
         return {
             "target": primary_target,
             "impact_score": impact_score,
@@ -2852,6 +2982,9 @@ class CodeFinder:
                 "criticality_score": round(criticality_score, 2),
                 "churn_score": round(churn_score, 2),
             },
+            "risk_score": risk_score,
+            "risk_factors": risk_factors,
+            "churn_status": churn_status,
             "direction": direction,
             "cross_repo_hops": cross_repo_hops,
             "unresolved_crossings": unresolved_crossings,

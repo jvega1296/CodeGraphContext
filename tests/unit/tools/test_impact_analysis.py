@@ -291,6 +291,42 @@ def test_analyze_impact_both_on_create_order_includes_consumer_repo_and_terrafor
     assert any("oms-order-consumer" in p for p in node_types_by_repo), "consumer repo missing"
     assert any(n["type"] == "Class" and "terra-projects-oms" in n["path"] for n in res["nodes"]), "Terraform node missing (requires Piece 3's BACKED_BY stitching to be reachable too -- extend the fake fixture once Task 12 lands)"
 
+def test_analyze_impact_includes_ported_risk_score_and_factors():
+    finder, recorder = _make_finder()
+    res = finder.analyze_impact(target="AuthService")
+    assert "risk_score" in res and 0.0 <= res["risk_score"] <= 1.0
+    assert set(res["risk_factors"].keys()) >= {
+        "security_sensitivity", "caller_count", "community_crossing", "test_coverage", "churn"
+    }
+    assert "churn_status" in res
+    # the existing fields must be unchanged
+    assert "impact_score" in res and "risk_level" in res and "risk_breakdown" in res
+
+def test_analyze_impact_degrades_gracefully_when_repo_has_no_git_history(tmp_path, monkeypatch):
+    # repo_path points at a real tmp_path with no .git
+    finder, recorder = _make_finder()
+    res = finder.analyze_impact(target="AuthService", repo_path=str(tmp_path))
+    assert res["churn_status"] == "unavailable"
+    assert res["risk_score"] >= 0.0  # call still succeeds and returns a usable score, just without the churn term
+
+def test_analyze_impact_both_includes_ported_risk_score_in_merged_block(tmp_path):
+    """direction="both" is handled by a separate return block
+    (_analyze_impact_both) that does not reuse the single-direction
+    method's return dict -- this must be wired independently, or a
+    one-sided fix would pass test_analyze_impact_includes_ported_risk_score_and_factors
+    above (which only exercises the default direction="upstream") while
+    silently leaving direction="both" without the new fields."""
+    finder, recorder = _make_finder()
+    res = finder.analyze_impact(target="validateOrder", direction="both", repo_path=str(tmp_path))
+    assert res["direction"] == "both"
+    assert "risk_score" in res and 0.0 <= res["risk_score"] <= 1.0
+    assert set(res["risk_factors"].keys()) >= {
+        "security_sensitivity", "caller_count", "community_crossing", "test_coverage", "churn"
+    }
+    assert res["churn_status"] == "unavailable"
+    # the existing fields must be unchanged
+    assert "impact_score" in res and "risk_level" in res and "risk_breakdown" in res
+
 @pytest.mark.parametrize("backend", ["neo4j", "falkordb"])
 def test_portable_field_helpers_handle_real_driver_objects(backend):
     """_portable_node_fields/_portable_rel_fields must work on the actual

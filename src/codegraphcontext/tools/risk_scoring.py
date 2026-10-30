@@ -732,6 +732,120 @@ def _parse_unified_diff(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
     return ranges
 
 
+_JAVA_TEST_FILENAME_RE = re.compile(r"^(?:Test\w+|\w+Tests?)\.java$")
+
+
+def is_test_file(path: str) -> bool:
+    """Java/JUnit-scoped equivalent of code-review-graph's ``is_test_file``
+    (``parser.py``), for :func:`CodeFinder.analyze_change_risk`'s
+    gap-candidate filter (Task 18).
+
+    The real version is a generic, multi-language-aware function backed by
+    several regex pattern sets (test-name patterns, test-dir patterns,
+    test-helper-dir patterns, a singular-vs-plural ``test``/``tests``
+    directory distinction, a shipped-test-package exclusion). Porting that
+    battery verbatim would be disproportionate given this plan's Java/JUnit
+    -only scope for test-linkage work (Decision #4) -- the same scope
+    :func:`find_test_coverage_count` already respects. This is a small,
+    proportionate equivalent instead, not a missed port.
+
+    A path is a test file when it sits under a mirrored ``src/test/java`` or
+    ``src/test/kotlin`` tree -- the same two source-root markers
+    :func:`find_test_coverage_count` substitutes ``src/main`` -> ``src/test``
+    for -- OR its filename alone matches a JUnit naming convention:
+    ``Test<Name>.java``, ``<Name>Test.java``, or ``<Name>Tests.java`` -- the
+    same three shapes :func:`find_test_coverage_count`'s ``candidate_names``
+    list generates for a sibling *function* name, checked here against the
+    file's own basename instead.
+    """
+    posix_path = path.replace("\\", "/")
+    if "src/test/java" in posix_path or "src/test/kotlin" in posix_path:
+        return True
+    filename = posix_path.rsplit("/", 1)[-1]
+    return bool(_JAVA_TEST_FILENAME_RE.match(filename))
+
+
+def build_change_risk_summary(
+    changed_file_count: int,
+    changed_func_count: int,
+    test_gaps: List[Dict[str, object]],
+    test_gaps_uncovered: int,
+    test_gaps_indirect: int,
+    overall_risk: float,
+    functions_truncated: bool,
+    max_funcs: int,
+    diff_ranges_unavailable: str,
+    churn_status: str,
+) -> str:
+    """Human-readable multi-line summary for :func:`CodeFinder.analyze_change_risk`.
+
+    Ported in spirit (not verbatim text) from code-review-graph's
+    ``analyze_changes`` ``summary_parts`` construction: file/function
+    counts, a gap-count line distinguishing "no tested caller found" from
+    "reached only through a caller", the overall risk score, and
+    conditional warning lines for truncation, degraded churn, and
+    unavailable diff ranges.
+
+    No flow-count line is rendered: ``affected_flows`` is always ``[]`` here
+    (flow modeling is out of scope -- see the plan's Non-goals), so a count
+    of it would always read "0 affected flow(s)" and tell the reader
+    nothing.
+    """
+    gap_line = f"  - {len(test_gaps)} test gap(s)"
+    if test_gaps_indirect:
+        gap_line += (
+            f" ({test_gaps_uncovered} with no tested caller found, "
+            f"{test_gaps_indirect} reached only through a caller)"
+        )
+
+    lines = [
+        f"Analyzed {changed_file_count} changed file(s):",
+        f"  - {changed_func_count} changed function(s)/class(es)",
+        gap_line,
+        f"  - Overall risk score: {overall_risk:.2f}",
+    ]
+
+    def _gap_names(entries: List[Dict[str, object]], limit: int = 5) -> List[str]:
+        seen: set = set()
+        names: List[str] = []
+        for g in entries:
+            name = g["name"]
+            if name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+            if len(names) >= limit:
+                break
+        return names
+
+    if test_gaps_uncovered:
+        unreached = [g for g in test_gaps if g["coverage"] != "indirect"]
+        lines.append(f"  - Untested: {', '.join(_gap_names(unreached))}")
+    if test_gaps_indirect:
+        indirect = [g for g in test_gaps if g["coverage"] == "indirect"]
+        lines.append(
+            f"  - Reached only through a caller: {', '.join(_gap_names(indirect))}"
+        )
+    if functions_truncated:
+        lines.append(
+            f"  - Warning: analysis capped at {max_funcs} functions "
+            "(set CGC_MAX_CHANGED_FUNCS to adjust)"
+        )
+    if diff_ranges_unavailable:
+        lines.append(
+            "  - Warning: line-level diff unavailable, whole files scored "
+            f"({diff_ranges_unavailable})"
+        )
+    if churn_status == CHURN_UNAVAILABLE:
+        lines.append(
+            "  - Degraded: change-frequency risk unavailable "
+            f"(git history did not answer within {_CHURN_TIMEOUT:.3g}s; "
+            "set CGC_CHURN_TIMEOUT to raise the budget). Risk scores "
+            "exclude the churn term."
+        )
+    return "\n".join(lines)
+
+
 def map_changes_to_nodes(session, changed_ranges: Dict[str, List[Tuple[int, int]]]) -> List[dict]:
     """Return Function/Class node dicts whose [line_number, end_line] overlaps a changed range.
 

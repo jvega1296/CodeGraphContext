@@ -379,6 +379,36 @@ def analyze_impact(code_finder: CodeFinder, **args) -> Dict[str, Any]:
         return {"error": f"Failed to analyze impact: {str(e)}"}
 
 
+def analyze_change_risk(code_finder: CodeFinder, **args) -> Dict[str, Any]:
+    """Tool to analyze a diff-level change set and produce a priority-ordered risk report (Task 18)."""
+    repo_path = args.get("repo_path")
+    base = args.get("base", "HEAD~1")
+    include_churn = args.get("include_churn", False)
+    require_vcs = args.get("require_vcs", False)
+
+    if not repo_path:
+        return {"error": "'repo_path' is a required argument"}
+
+    try:
+        debug_log(
+            f"Analyzing change risk for repo_path={repo_path}, base={base}, "
+            f"include_churn={include_churn}, require_vcs={require_vcs}"
+        )
+        results = code_finder.analyze_change_risk(
+            repo_path=repo_path,
+            base=base,
+            include_churn=include_churn,
+            require_vcs=require_vcs,
+        )
+        return {
+            "success": True,
+            "results": results
+        }
+    except Exception as e:
+        debug_log(f"Error analyzing change risk: {str(e)}")
+        return {"error": f"Failed to analyze change risk: {str(e)}"}
+
+
 def stitch_infrastructure(code_finder: CodeFinder, **args) -> Dict[str, Any]:
     """Tool to connect wire-coupling Topic/Subscription nodes to the
     Terraform resources that define them (Piece 3, Task 12).

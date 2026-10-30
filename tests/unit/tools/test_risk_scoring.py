@@ -9,12 +9,14 @@ from codegraphcontext.tools.risk_scoring import (
     CHURN_OK,
     CHURN_UNAVAILABLE,
     ChangeDiscoveryError,
+    build_change_risk_summary,
     caller_count_score,
     churn_score,
     clear_churn_cache,
     community_crossing_score,
     compute_file_churn_with_status,
     find_test_coverage_count,
+    is_test_file,
     map_changes_to_nodes,
     parse_diff_ranges,
     parse_git_diff_ranges,
@@ -479,6 +481,57 @@ def test_map_changes_to_nodes_suffix_match_fallback_catches_path_form_mismatch()
     nodes = map_changes_to_nodes(session, {"src/main/java/Foo.java": [(25, 35)]})
     assert len(nodes) == 1
     assert nodes[0]["uid"] == "func_foo"
+
+
+def test_is_test_file_detects_colocated_src_test_java_tree():
+    assert is_test_file("src/test/java/com/az/oms/OrderValidatorTest.java") is True
+
+
+def test_is_test_file_detects_colocated_src_test_kotlin_tree():
+    assert is_test_file("src/test/kotlin/com/az/oms/OrderValidatorTest.kt") is True
+
+
+def test_is_test_file_detects_junit_filename_convention_outside_src_test():
+    # Each of the three shapes find_test_coverage_count's candidate_names
+    # generates for a function name, checked here against a bare filename
+    # living outside any src/test tree -- the directory check alone would
+    # miss all three.
+    assert is_test_file("src/main/java/com/az/oms/TestOrderValidator.java") is True
+    assert is_test_file("src/main/java/com/az/oms/OrderValidatorTest.java") is True
+    assert is_test_file("src/main/java/com/az/oms/OrderValidatorTests.java") is True
+
+
+def test_is_test_file_false_for_ordinary_production_file():
+    assert is_test_file("src/main/java/com/az/oms/OrderValidator.java") is False
+
+
+def test_build_change_risk_summary_renders_gap_counts_and_warnings():
+    test_gaps = [
+        {"name": "createOrder", "file": "a.java", "coverage": "none"},
+        {"name": "helper", "file": "b.java", "coverage": "indirect"},
+    ]
+    summary = build_change_risk_summary(
+        changed_file_count=2,
+        changed_func_count=2,
+        test_gaps=test_gaps,
+        test_gaps_uncovered=1,
+        test_gaps_indirect=1,
+        overall_risk=0.4567,
+        functions_truncated=True,
+        max_funcs=500,
+        diff_ranges_unavailable="git timed out",
+        churn_status=CHURN_UNAVAILABLE,
+    )
+    assert "Analyzed 2 changed file(s)" in summary
+    assert "2 test gap(s)" in summary
+    assert "1 with no tested caller found" in summary
+    assert "1 reached only through a caller" in summary
+    assert "createOrder" in summary
+    assert "helper" in summary
+    assert "Overall risk score: 0.46" in summary
+    assert "capped at 500 functions" in summary
+    assert "git timed out" in summary
+    assert "Degraded: change-frequency risk unavailable" in summary
 
 
 def test_map_changes_to_nodes_bare_exact_match_alone_would_miss_the_suffix_case():

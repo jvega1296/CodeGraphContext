@@ -594,5 +594,34 @@ TOOLS = {
                 "graph_name": _GRAPH_NAME_PROP
             }
         }
+    },
+    "analyze_change_risk": {
+        "name": "analyze_change_risk",
+        "description": "Analyze a diff-level change set (e.g. a pull request) and produce a priority-ordered risk report: a per-function risk score, test-coverage gaps, and the top 10 functions/classes to review first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Path to the repository to diff and score."
+                },
+                "base": {
+                    "type": "string",
+                    "description": "Optional: Git ref (or SVN revision range) to diff against (default: 'HEAD~1').",
+                    "default": "HEAD~1"
+                },
+                "include_churn": {
+                    "type": "boolean",
+                    "description": "Optional: Add an opt-in change-frequency term to each node's risk score (default: false).",
+                    "default": False
+                },
+                "require_vcs": {
+                    "type": "boolean",
+                    "description": "Optional: Fail with an error instead of silently reporting an all-clear when the changed lines cannot be determined (default: false).",
+                    "default": False
+                }
+            },
+            "required": ["repo_path"]
+        }
     }
 }

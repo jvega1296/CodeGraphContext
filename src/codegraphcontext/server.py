@@ -359,6 +359,9 @@ class MCPServer:
     def stitch_infrastructure_tool(self, **args) -> Dict[str, Any]:
         return analysis_handlers.stitch_infrastructure(self.code_finder, **args)
 
+    def analyze_change_risk_tool(self, **args) -> Dict[str, Any]:
+        return analysis_handlers.analyze_change_risk(self.code_finder, **args)
+
     def find_code_tool(self, **args) -> Dict[str, Any]:
         return analysis_handlers.find_code(self.code_finder, **args)
 
@@ -741,6 +744,7 @@ class MCPServer:
             "analyze_code_relationships": self.analyze_code_relationships_tool,
             "analyze_impact": self.analyze_impact_tool,
             "stitch_infrastructure": self.stitch_infrastructure_tool,
+            "analyze_change_risk": self.analyze_change_risk_tool,
             "watch_directory": self.watch_directory_tool,
             "execute_cypher_query": self.execute_cypher_query_tool,
             "add_code_to_graph": self.add_code_to_graph_tool,

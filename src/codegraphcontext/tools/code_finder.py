@@ -50,6 +50,20 @@ _TEST_HOOK_NAMES = {
     "setupmodule", "teardownmodule", "setup_method", "teardown_method",
 }
 
+# Lifecycle methods exempted from analyze_change_risk's test-gap report
+# (Task 18): a changed setUp/__init__/etc. is framework-invoked scaffolding,
+# not a gap in the author's own test coverage. Exact port of
+# code-review-graph's changes.py _TEST_GAP_EXEMPT_NAMES, kept here (rather
+# than in risk_scoring.py) since it is consumed only by
+# CodeFinder.analyze_change_risk below -- the same co-location the ported
+# original uses, and the same pattern _TEST_HOOK_NAMES above already follows
+# in this file for a similar purpose.
+_TEST_GAP_EXEMPT_NAMES = frozenset({
+    "setUp", "tearDown", "setUpBeforeClass", "tearDownAfterClass",
+    "setup_method", "teardown_method", "setUpClass", "tearDownClass",
+    "__construct", "__init__", "__destruct",
+})
+
 
 def _classify_dead_code_confidence(row: dict) -> tuple:
     """(confidence, reason) for a zero-caller symbol (#1332).
@@ -261,6 +275,21 @@ def _caller_paths_query() -> str:
         MATCH (c)-[r:{_IMPACT_REL_TYPES}]->(target)
         WHERE target.uid IN $target_uids
         RETURN c.path as path
+    """
+
+
+def _caller_name_path_query() -> str:
+    """Caller name+path for analyze_change_risk's one-hop indirect-test-gap
+    check (Task 18). Same direction and relationship types as
+    ``_caller_paths_query`` (callers pointing into the target), but also
+    returning each caller's name -- ``_caller_paths_query`` only returns
+    path, which isn't enough to query ``find_test_coverage_count`` against
+    a caller's own JUnit-naming test-coverage candidates.
+    """
+    return f"""
+        MATCH (c)-[r:{_IMPACT_REL_TYPES}]->(target)
+        WHERE target.uid IN $target_uids
+        RETURN c.name as name, c.path as path
     """
 
 
@@ -2376,6 +2405,171 @@ class CodeFinder:
         }
         risk_score = round(min(max(sum(risk_factors.values()), 0.0), 1.0), 4)
         return risk_score, risk_factors, churn_status
+
+    def analyze_change_risk(
+        self,
+        repo_path: str,
+        base: str = "HEAD~1",
+        include_churn: bool = False,
+        require_vcs: bool = False,
+    ) -> Dict[str, Any]:
+        """Diff-level, priority-ordered risk report for a change set (Task 18).
+
+        Port of code-review-graph's ``analyze_changes`` (changes.py lines
+        655-976), orchestrating Tasks 13-17's ``risk_scoring.py`` surface:
+        ``parse_diff_ranges`` -> ``map_changes_to_nodes`` -> the
+        ``CGC_MAX_CHANGED_FUNCS`` cap -> a per-node five-factor risk score
+        (Task 16's ``_compute_ported_risk_score``, shared with
+        ``analyze_impact``) -> gap-candidate filtering and test-gap
+        classification -> the top-10 ``review_priorities``.
+
+        Unlike the ported original, CGC's signature carries no separate
+        ``changed_files`` parameter -- there is nothing already known to
+        degrade to if the line-level diff cannot be read. When
+        ``require_vcs=True`` and ``parse_diff_ranges`` raises
+        ``ChangeDiscoveryError``, it is therefore left to propagate (an
+        MCP-handler caller turns it into an error response) rather than
+        caught and downgraded to a partial result that would misrepresent
+        itself as complete.
+        """
+        raw_ranges = risk_scoring.parse_diff_ranges(repo_path, base, require_vcs=require_vcs)
+        diff_ranges_unavailable = ""
+
+        with self.driver.session() as session:
+            changed_nodes = risk_scoring.map_changes_to_nodes(session, raw_ranges)
+
+        # map_changes_to_nodes' own Cypher already restricts results to
+        # (n:Function OR n:Class) -- CGC's label system, equivalent to
+        # code-review-graph's `kind in ("Function", "Class")` filter -- so no
+        # further kind check is needed here. (The real source also matches a
+        # "Test" kind and excludes a Verilog-specific flag; neither concept
+        # exists in CGC.)
+        max_funcs = risk_scoring.env_int("CGC_MAX_CHANGED_FUNCS", 500)
+        functions_truncated = len(changed_nodes) > max_funcs
+        changed_funcs = changed_nodes[:max_funcs] if functions_truncated else changed_nodes
+
+        # Resolved once for the whole batch, not per node:
+        # compute_file_churn_with_status is itself cache-keyed by
+        # (repo, HEAD, window), but even a cache hit still pays one `git
+        # rev-parse` subprocess per call -- resolving it once here, rather
+        # than letting every node's _compute_ported_risk_score call resolve
+        # it again internally, is both correct (churn availability is a
+        # repo-wide property) and avoids up to 500 redundant subprocesses.
+        if include_churn:
+            _, churn_status = risk_scoring.compute_file_churn_with_status(repo_path)
+        else:
+            churn_status = risk_scoring.CHURN_OFF
+
+        node_risks: List[Dict[str, Any]] = []
+        for node in changed_funcs:
+            with self.driver.session() as session:
+                res = session.run(_criticality_query("upstream"), target_uids=[node["uid"]])
+                rec = res.single()
+                in_degree = rec["count"] if rec else 0
+            risk_score, risk_factors, _node_churn_status = self._compute_ported_risk_score(
+                [node], in_degree, repo_path, include_churn,
+            )
+            node_risks.append({**node, "risk_score": risk_score, "risk_factors": risk_factors})
+
+        overall_risk = max((nr["risk_score"] for nr in node_risks), default=0.0)
+
+        # Gap-candidate filtering: exclude test code (the ported
+        # `is_test_file`-equivalent) and lifecycle methods
+        # (_TEST_GAP_EXEMPT_NAMES). The real source also excludes a
+        # TypeScript-interface-equivalent "non-runtime construct"; CGC has no
+        # such concept surfaced yet, so that exclusion is a no-op here for
+        # Java-only scope.
+        gap_candidates = [
+            node for node in changed_funcs
+            if not risk_scoring.is_test_file(node["path"])
+            and node["name"] not in _TEST_GAP_EXEMPT_NAMES
+        ]
+
+        test_gaps: List[Dict[str, Any]] = []
+        indirect_count = 0
+        with self.driver.session() as session:
+            for node in gap_candidates:
+                direct_count = risk_scoring.find_test_coverage_count(
+                    session, node["name"], node["path"],
+                )
+                if direct_count > 0:
+                    # Directly-tested nodes never appear in test_gaps, same
+                    # as the ported original.
+                    continue
+
+                entry: Dict[str, Any] = {
+                    "name": node["name"],
+                    "file": node["path"],
+                    "line_start": node.get("line_number"),
+                    "line_end": node.get("end_line"),
+                }
+
+                # Indirect check: a simple one-hop-caller-is-tested walk,
+                # since full get_caller_test_routes multi-hop walking is out
+                # of scope per Decision #4's lightweight-proxy framing.
+                covered_via: Optional[str] = None
+                res_callers = session.run(
+                    _caller_name_path_query(), target_uids=[node["uid"]],
+                )
+                for row in res_callers:
+                    caller_name = row.get("name")
+                    caller_path = row.get("path")
+                    if not caller_name or not caller_path:
+                        continue
+                    if risk_scoring.find_test_coverage_count(
+                        session, caller_name, caller_path,
+                    ) > 0:
+                        covered_via = caller_name
+                        break
+
+                if covered_via is not None:
+                    entry["coverage"] = "indirect"
+                    entry["covered_via"] = covered_via
+                    entry["covered_depth"] = 1
+                    # `covered_by` (an actual covering test's name) is
+                    # omitted: it would need a third query shape (a
+                    # find_test_coverage_count variant returning a name
+                    # instead of a count) for a field no test here asserts
+                    # on -- not a proportionate addition at CGC's one-hop
+                    # scope.
+                    indirect_count += 1
+                else:
+                    entry["coverage"] = "none"
+                test_gaps.append(entry)
+
+        uncovered_count = len(test_gaps) - indirect_count
+
+        review_priorities = sorted(
+            node_risks, key=lambda x: x["risk_score"], reverse=True,
+        )[:10]
+
+        summary = risk_scoring.build_change_risk_summary(
+            changed_file_count=len(raw_ranges),
+            changed_func_count=len(changed_funcs),
+            test_gaps=test_gaps,
+            test_gaps_uncovered=uncovered_count,
+            test_gaps_indirect=indirect_count,
+            overall_risk=overall_risk,
+            functions_truncated=functions_truncated,
+            max_funcs=max_funcs,
+            diff_ranges_unavailable=diff_ranges_unavailable,
+            churn_status=churn_status,
+        )
+
+        return {
+            "summary": summary,
+            "risk_score": overall_risk,
+            "changed_functions": node_risks,
+            "affected_flows": [],
+            "test_gaps": test_gaps,
+            "test_gaps_total": len(test_gaps),
+            "test_gaps_uncovered": uncovered_count,
+            "test_gaps_indirect": indirect_count,
+            "review_priorities": review_priorities,
+            "functions_truncated": functions_truncated,
+            "diff_ranges_unavailable": diff_ranges_unavailable,
+            "churn_status": churn_status,
+        }
 
     def _analyze_impact_both(
         self,

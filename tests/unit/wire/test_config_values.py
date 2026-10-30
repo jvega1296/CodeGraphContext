@@ -125,3 +125,40 @@ def test_store_known_profiles_and_all_entries():
     assert {(e.key, e.profile) for e in s.all_entries()} == {
         ("a", ""), ("b", "prod"), ("c", "staging"),
     }
+
+
+# ── Multi-hop placeholder resolution ────────────────────────────────────────
+#
+# A Spring YAML key whose own value is ANOTHER `${...}` placeholder (common
+# when the committed application.yml defers to a deploy-time environment
+# variable, e.g. `az.pubsub.subscription.name: ${PUB_SUB_SUBSCRIPTION_NAME}`)
+# must not be reported as fully resolved just because the FIRST key was
+# found -- the substituted value itself still needs resolving.
+
+def test_resolve_follows_a_value_that_is_itself_a_placeholder():
+    s = ConfigValueStore(repo_root="/repo")
+    s.add(_mk("az.pubsub.subscription.name", "${PUB_SUB_SUBSCRIPTION_NAME}"))
+    s.add(_mk("PUB_SUB_SUBSCRIPTION_NAME", "projects/p/subscriptions/real-sub"))
+    r = s.resolve_placeholders("${az.pubsub.subscription.name}")
+    assert r.output == "projects/p/subscriptions/real-sub"
+    assert r.fully_resolved()
+    assert ("az.pubsub.subscription.name", "base") in r.used
+    assert ("PUB_SUB_SUBSCRIPTION_NAME", "base") in r.used
+
+
+def test_resolve_reports_unresolved_when_second_hop_has_no_value():
+    s = ConfigValueStore(repo_root="/repo")
+    s.add(_mk("az.pubsub.subscription.name", "${PUB_SUB_SUBSCRIPTION_NAME}"))
+    r = s.resolve_placeholders("${az.pubsub.subscription.name}")
+    assert r.output == "${PUB_SUB_SUBSCRIPTION_NAME}"
+    assert not r.fully_resolved()
+    assert r.unresolved == ["PUB_SUB_SUBSCRIPTION_NAME"]
+
+
+def test_resolve_circular_placeholder_terminates_and_reports_unresolved():
+    s = ConfigValueStore(repo_root="/repo")
+    s.add(_mk("a", "${b}"))
+    s.add(_mk("b", "${a}"))
+    r = s.resolve_placeholders("${a}")
+    assert not r.fully_resolved()
+    assert r.unresolved

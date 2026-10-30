@@ -27,6 +27,12 @@ _PLACEHOLDER_RE = re.compile(r"\$\{([^:{}]+)(?::([^{}]*))?\}")
 # application.yml with no -profile suffix).
 BASE_PROFILE = ""
 
+# Bound on multi-hop placeholder resolution (A -> ${B} -> literal). Generous
+# enough for any real chain this codebase has seen (two hops: a Spring YAML
+# key deferring to an env var) while still terminating on a circular
+# reference instead of looping forever.
+_MAX_RESOLUTION_HOPS = 5
+
 
 @dataclass(frozen=True)
 class ConfigValue:
@@ -85,47 +91,81 @@ class ConfigValueStore:
         Leaves unresolved `${...}` in place so callers can still emit the
         original literal as a SYMBOLIC-tier edge and let cross-repo linkage
         happen on the raw placeholder key.
+
+        Resolution is multi-hop (bounded): a resolved value that itself
+        contains another `${...}` placeholder (e.g. a Spring YAML key whose
+        value is `${SOME_ENV_VAR}`, common when a committed application.yml
+        defers the real value to a deploy-time environment variable) is
+        re-scanned and resolved again, up to ``_MAX_RESOLUTION_HOPS`` times.
+        Without this, a single substitution pass reports `fully_resolved() ==
+        True` for an output that is still textually a placeholder, because
+        the outer key *was* found -- the inner one was simply never looked
+        at. ``used``/``unresolved`` accumulate across every hop actually
+        attempted.
         """
-        resolved_text_parts: List[str] = []
-        cursor = 0
-        used: List[Tuple[str, str]] = []   # (key, resolution_source)  base|profile|default
+        text_to_resolve = text
+        used: List[Tuple[str, str]] = []
         unresolved: List[str] = []
 
-        for m in _PLACEHOLDER_RE.finditer(text):
-            resolved_text_parts.append(text[cursor:m.start()])
-            key = m.group(1)
-            default = m.group(2)
+        for _ in range(_MAX_RESOLUTION_HOPS):
+            resolved_text_parts: List[str] = []
+            cursor = 0
+            hop_used: List[Tuple[str, str]] = []
+            hop_unresolved: List[str] = []
 
-            # Profile match wins over base.
-            entry = None
-            source_label = ""
-            if active_profile:
-                profile_entry = self._by_profile.get(active_profile, {}).get(key)
-                if profile_entry is not None:
-                    entry = profile_entry
-                    source_label = f"profile:{active_profile}"
-            if entry is None:
-                base_entry = self._by_profile.get(BASE_PROFILE, {}).get(key)
-                if base_entry is not None:
-                    entry = base_entry
-                    source_label = "base"
+            for m in _PLACEHOLDER_RE.finditer(text_to_resolve):
+                resolved_text_parts.append(text_to_resolve[cursor:m.start()])
+                key = m.group(1)
+                default = m.group(2)
 
-            if entry is not None:
-                resolved_text_parts.append(entry.value)
-                used.append((key, source_label))
-            elif default is not None:
-                resolved_text_parts.append(default)
-                used.append((key, "default"))
-            else:
-                resolved_text_parts.append(m.group(0))
-                unresolved.append(key)
+                # Profile match wins over base.
+                entry = None
+                source_label = ""
+                if active_profile:
+                    profile_entry = self._by_profile.get(active_profile, {}).get(key)
+                    if profile_entry is not None:
+                        entry = profile_entry
+                        source_label = f"profile:{active_profile}"
+                if entry is None:
+                    base_entry = self._by_profile.get(BASE_PROFILE, {}).get(key)
+                    if base_entry is not None:
+                        entry = base_entry
+                        source_label = "base"
 
-            cursor = m.end()
-        resolved_text_parts.append(text[cursor:])
+                if entry is not None:
+                    resolved_text_parts.append(entry.value)
+                    hop_used.append((key, source_label))
+                elif default is not None:
+                    resolved_text_parts.append(default)
+                    hop_used.append((key, "default"))
+                else:
+                    resolved_text_parts.append(m.group(0))
+                    hop_unresolved.append(key)
+
+                cursor = m.end()
+            resolved_text_parts.append(text_to_resolve[cursor:])
+            hop_output = "".join(resolved_text_parts)
+
+            used.extend(hop_used)
+            if hop_output == text_to_resolve:
+                # Nothing changed this hop (either no placeholders at all, or
+                # every remaining one is unresolved) -- further hops cannot
+                # help, so stop and report whatever is still unresolved.
+                unresolved = hop_unresolved
+                text_to_resolve = hop_output
+                break
+            text_to_resolve = hop_output
+            unresolved = hop_unresolved
+        else:
+            # Hop budget exhausted while output was still changing each
+            # round -- almost certainly a circular reference (A -> ${B} ->
+            # ${A}). Re-scan the final text once more for any placeholder
+            # still present so `unresolved` is accurate rather than empty.
+            unresolved = [m.group(1) for m in _PLACEHOLDER_RE.finditer(text_to_resolve)]
 
         return PlaceholderResolution(
             input=text,
-            output="".join(resolved_text_parts),
+            output=text_to_resolve,
             used=used,
             unresolved=unresolved,
         )

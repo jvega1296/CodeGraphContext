@@ -2651,18 +2651,20 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
                   Publish Graph
                 </button>
 
-                {/* Mobile ChatGPT Tunnel */}
-                <button
-                  onClick={() => {
-                    handleConnectChatGPT();
-                    setShowMobileMenu(false);
-                  }}
-                  className={`flex items-center gap-2 text-[11px] uppercase tracking-widest font-bold px-4 py-2 border rounded-xl transition-all text-left w-full ${isDark ? 'hover:bg-purple-500/10 border-white/5 text-white' : 'hover:bg-black/5 border-black/5 text-gray-800'}`}
-                >
-                  <div className="w-2 h-2 rounded-full bg-amber-500/80 shadow-[0_0_6px_#f59e0b]" />
-                  <MessageSquare className="w-3.5 h-3.5 text-purple-400" />
-                  ChatGPT Tunnel
-                </button>
+                {/* Mobile ChatGPT Tunnel — only when no backend is configured */}
+                {!backendParam && (
+                  <button
+                    onClick={() => {
+                      handleConnectChatGPT();
+                      setShowMobileMenu(false);
+                    }}
+                    className={`flex items-center gap-2 text-[11px] uppercase tracking-widest font-bold px-4 py-2 border rounded-xl transition-all text-left w-full ${isDark ? 'hover:bg-purple-500/10 border-white/5 text-white' : 'hover:bg-black/5 border-black/5 text-gray-800'}`}
+                  >
+                    <div className="w-2 h-2 rounded-full bg-amber-500/80 shadow-[0_0_6px_#f59e0b]" />
+                    <MessageSquare className="w-3.5 h-3.5 text-purple-400" />
+                    ChatGPT Tunnel
+                  </button>
+                )}
 
                 {/* Mobile Mode Selector */}
                 <div className="border-t border-white/5 my-0.5" />

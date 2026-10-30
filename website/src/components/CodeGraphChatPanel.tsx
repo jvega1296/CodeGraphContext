@@ -11,13 +11,20 @@ export interface CodeGraphChatPanelProps {
 
 // Subset markdown → HTML: headers, bold, italic, inline code, code blocks, bullet lists.
 // No external library needed for the subset LLMs actually produce for graph explanations.
-function renderMarkdown(text: string): string {
+function renderMarkdown(text: string, isDark: boolean): string {
   if (!text) return "";
   const lines = text.split("\n");
   const out: string[] = [];
   let inCodeBlock = false;
   let codeLines: string[] = [];
   let listItems: string[] = [];
+
+  const inlineCodeCls = isDark
+    ? "text-purple-300 bg-black/30 px-1 rounded text-[10.5px] font-mono"
+    : "text-purple-700 bg-black/[0.07] px-1 rounded text-[10.5px] font-mono";
+  const blockCodeCls = isDark
+    ? "overflow-x-auto text-[10.5px] font-mono bg-black/40 border border-white/[0.08] rounded-lg p-2 my-1 whitespace-pre-wrap"
+    : "overflow-x-auto text-[10.5px] font-mono bg-black/[0.05] border border-black/[0.08] rounded-lg p-2 my-1 whitespace-pre-wrap";
 
   function flushList() {
     if (listItems.length === 0) return;
@@ -32,7 +39,7 @@ function renderMarkdown(text: string): string {
       .replace(/>/g, "&gt;")
       .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
       .replace(/\*(.*?)\*/g, "<em>$1</em>")
-      .replace(/`([^`]+)`/g, '<code class="text-purple-300 bg-black/30 px-1 rounded text-[10.5px] font-mono">$1</code>');
+      .replace(/`([^`]+)`/g, `<code class="${inlineCodeCls}">$1</code>`);
   }
 
   function esc(s: string): string {
@@ -43,7 +50,7 @@ function renderMarkdown(text: string): string {
     if (line.startsWith("```")) {
       if (inCodeBlock) {
         out.push(
-          '<pre class="overflow-x-auto text-[10.5px] font-mono bg-black/40 border border-white/5 rounded-lg p-2 my-1 whitespace-pre-wrap">' +
+          `<pre class="${blockCodeCls}">` +
             esc(codeLines.join("\n")) +
             "</pre>"
         );
@@ -262,7 +269,7 @@ export default function CodeGraphChatPanel({
                   </div>
                   <div
                     className={textColor}
-                    dangerouslySetInnerHTML={{ __html: renderMarkdown(result.explanation) }}
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(result.explanation, isDark) }}
                   />
                 </div>
               )}

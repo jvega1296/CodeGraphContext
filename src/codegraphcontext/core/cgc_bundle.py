@@ -1590,6 +1590,7 @@ cgc import <bundle-file>.cgc
         'DbTable': 'fqn', 'Datasource': 'name', 'ExternalClass': 'name',
         'DbColumn': 'uid', 'RedisKeyPattern': 'uid',
         'GradleModule': 'name', 'MavenModule': 'uid', 'ExternalLibrary': 'uid',
+        'Topic': 'uid', 'Subscription': 'uid', 'Endpoint': 'uid',
     }
     _UID_PARTS = {
         'Function': ['name', 'path', 'line_number', 'occurrence_index'],
@@ -1613,6 +1614,9 @@ cgc import <bundle-file>.cgc
         'RedisKeyPattern': ['pattern', 'datasource_name'],
         'MavenModule': ['group_id', 'artifact_id'],
         'ExternalLibrary': ['group_id', 'artifact_id'],
+        'Topic': ['system', 'name'],
+        'Subscription': ['name', 'project_id'],
+        'Endpoint': ['protocol', 'method', 'path'],
     }
 
     def _import_node_batch(

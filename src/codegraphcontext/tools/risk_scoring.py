@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import threading
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from codegraphcontext.wire.kafka_scanner import DEFAULT_JAVA_SOURCE_DIRS
@@ -466,3 +467,302 @@ def compute_file_churn_with_status(
 def churn_score(commit_count: int) -> float:
     """min(commit_count / _CHURN_SATURATION, 1.0) * _CHURN_WEIGHT -- exact port of code-review-graph's formula."""
     return min(commit_count / _CHURN_SATURATION, 1.0) * _CHURN_WEIGHT
+
+
+class ChangeDiscoveryError(RuntimeError):
+    """The set of changed files or lines could not be determined.
+
+    Distinct from "there are no changes" on purpose: a review gate keyed on
+    an all-clear must not pass a pull request that was never looked at.
+    Raised when the VCS binary is missing, times out, or fails.
+
+    Also a RuntimeError: callers that catch RuntimeError keep working.
+    """
+
+
+# Diff parsing runs inside MCP tool calls too, so it gets its own timeout
+# budget rather than sharing one with churn: a slow repository should not
+# make the diff-parsing path (Task 18) wait on the churn walk's budget, or
+# vice versa.
+_GIT_TIMEOUT = env_int("CGC_GIT_TIMEOUT", 30)
+
+_SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
+_SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
+
+
+def _vcs_unavailable(tool: str, exc: BaseException) -> ChangeDiscoveryError:
+    """Describe a VCS command that could not be run at all.
+
+    A missing binary and a timeout say nothing about the working tree, so no
+    caller may read them as "no lines changed".
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return ChangeDiscoveryError(
+            f"could not determine the changed lines: {tool} timed out after "
+            f"{_GIT_TIMEOUT}s. Raise CGC_GIT_TIMEOUT, or re-run when the "
+            "repository is not busy."
+        )
+    return ChangeDiscoveryError(
+        f"could not determine the changed lines: {tool} could not be run "
+        f"({exc}). Install {tool} and make sure it is on PATH."
+    )
+
+
+def parse_git_diff_ranges(
+    repo_root: str,
+    base: str = "HEAD~1",
+    *,
+    require_vcs: bool = False,
+) -> Dict[str, List[Tuple[int, int]]]:
+    """Run ``git diff --unified=0`` and extract changed line ranges per file.
+
+    Args:
+        repo_root: Absolute path to the repository root.
+        base: Git ref to diff against (default: ``HEAD~1``).
+        require_vcs: Raise ChangeDiscoveryError when git cannot be run at
+            all, instead of returning an empty mapping that a caller would
+            read as "no lines changed".
+
+    Returns:
+        Mapping of file paths to lists of ``(start_line, end_line)`` tuples.
+        Returns an empty dict on error.
+    """
+    if not _SAFE_GIT_REF.match(base):
+        logger.warning("Invalid git ref rejected: %s", base)
+        return {}
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--unified=0", base, "--"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=repo_root,
+            timeout=_GIT_TIMEOUT,
+        )
+        if result.returncode != 0:
+            logger.warning("git diff failed (rc=%d): %s", result.returncode, result.stderr[:200])
+            return {}
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("git diff error: %s", exc)
+        if require_vcs:
+            raise _vcs_unavailable("git", exc) from exc
+        return {}
+
+    return _parse_unified_diff(result.stdout)
+
+
+def parse_svn_diff_ranges(
+    repo_root: str,
+    rev_range: Optional[str] = None,
+    *,
+    require_vcs: bool = False,
+) -> Dict[str, List[Tuple[int, int]]]:
+    """Run ``svn diff`` and extract changed line ranges per file.
+
+    Args:
+        repo_root: Absolute path to the SVN working copy root.
+        rev_range: Optional SVN revision range in ``rXXX:HEAD`` format.
+            When *None*, diffs the working copy against BASE (local changes).
+
+    Returns:
+        Mapping of file paths to lists of ``(start_line, end_line)`` tuples.
+        Returns an empty dict on error.
+    """
+    cmd = ["svn", "diff", "--non-interactive"]
+    if rev_range:
+        if not _SAFE_SVN_REV.match(rev_range):
+            logger.warning("Invalid SVN revision range rejected: %s", rev_range)
+            return {}
+        cmd.extend(["-r", rev_range])
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=repo_root,
+            timeout=_GIT_TIMEOUT,
+        )
+        if result.returncode != 0:
+            logger.warning("svn diff failed (rc=%d): %s", result.returncode, result.stderr[:200])
+            return {}
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("svn diff error: %s", exc)
+        if require_vcs:
+            raise _vcs_unavailable("svn", exc) from exc
+        return {}
+
+    return _parse_unified_diff(result.stdout)
+
+
+def parse_diff_ranges(
+    repo_root: str,
+    base: str = "HEAD~1",
+    *,
+    require_vcs: bool = False,
+) -> Dict[str, List[Tuple[int, int]]]:
+    """Auto-detect VCS and return changed line ranges per file.
+
+    Dispatches to parse_git_diff_ranges for Git repositories and
+    parse_svn_diff_ranges for SVN working copies.
+
+    Args:
+        repo_root: Absolute path to the repository/working-copy root.
+        base: For Git: the ref to diff against (default ``HEAD~1``).
+              For SVN: an optional revision range (e.g. ``"r100:HEAD"``);
+              when *base* is not a valid SVN revision, working-copy changes
+              (``svn diff``) are used instead.
+        require_vcs: Raise ChangeDiscoveryError when the VCS binary is
+            missing or times out, instead of returning ``{}``.
+    """
+    root_path = Path(repo_root)
+    if (root_path / ".svn").exists():
+        rev_range = base if _SAFE_SVN_REV.match(base) else None
+        return parse_svn_diff_ranges(repo_root, rev_range, require_vcs=require_vcs)
+    return parse_git_diff_ranges(repo_root, base, require_vcs=require_vcs)
+
+
+_C_QUOTE_ESCAPES = {
+    "a": "\a", "b": "\b", "f": "\f", "n": "\n",
+    "r": "\r", "t": "\t", "v": "\v", "\\": "\\", '"': '"',
+}
+
+
+def _unquote_c_path(quoted: str) -> str:
+    """Decode git's C-style quoted path back to text.
+
+    With ``core.quotePath`` (the default) git writes a path containing a
+    non-ASCII or control byte as ``"src/caf\\303\\251.py"``: double-quoted,
+    with backslash escapes and three-digit octal escapes for raw bytes. The
+    octal escapes are UTF-8 bytes, so they are reassembled before decoding.
+    """
+    raw = bytearray()
+    index, end = 1, len(quoted) - 1
+    while index < end:
+        char = quoted[index]
+        if char != "\\":
+            raw.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        nxt = quoted[index + 1] if index + 1 < end else ""
+        if nxt in _C_QUOTE_ESCAPES:
+            raw.extend(_C_QUOTE_ESCAPES[nxt].encode("utf-8"))
+            index += 2
+            continue
+        octal = ""
+        while len(octal) < 3 and index + 1 + len(octal) < end:
+            digit = quoted[index + 1 + len(octal)]
+            if digit not in "01234567":
+                break
+            octal += digit
+        if octal:
+            raw.append(int(octal, 8) & 0xFF)
+            index += 1 + len(octal)
+            continue
+        raw.extend(b"\\")
+        index += 1
+    return raw.decode("utf-8", "replace")
+
+
+def _diff_header_path(rest: str) -> Optional[str]:
+    """Extract the post-image path from the text after ``+++ ``.
+
+    Git writes the path three ways, and only the plainest one is a bare
+    ``b/path``: it appends a TAB when the path contains a space, and
+    C-quotes the whole ``"b/path"`` when it contains a non-ASCII or control
+    byte. Returns None for ``/dev/null``, the post-image of a deleted file.
+    """
+    rest = rest.rstrip("\r")
+    if rest.startswith('"'):
+        closing = rest.rfind('"')
+        path = _unquote_c_path(rest[: closing + 1])
+    else:
+        # The trailing TAB is a separator, never part of the path: git emits
+        # one only when the path itself contains a space.
+        path = rest.split("\t", 1)[0]
+    if path.startswith("b/"):
+        path = path[2:]
+        return path or None
+    return None
+
+
+# The post-image header, in every spelling git writes it: a bare ``b/path``,
+# the same with the TAB git appends when the path contains a space, the
+# C-quoted ``"b/path"`` it uses when the path contains a non-ASCII or
+# control byte, and ``/dev/null`` for a deleted file. Anchored on those
+# three shapes so an added line that merely starts with "+++ " is not read
+# as a header.
+_POST_IMAGE_HEADER = re.compile(
+    r'^\+\+\+ (/dev/null|"b/(?:[^"\\]|\\.)*"|b/.*)$'
+)
+
+
+def _parse_unified_diff(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
+    """Parse unified diff output into file -> line-range mappings.
+
+    Handles the ``@@ -old,count +new,count @@`` hunk header format.
+    """
+    ranges: Dict[str, List[Tuple[int, int]]] = {}
+    current_file: Optional[str] = None
+
+    # Match "@@ ... +start,count @@" or "@@ ... +start @@"
+    hunk_pattern = re.compile(r"^@@ .+? \+(\d+)(?:,(\d+))? @@")
+
+    for line in diff_text.splitlines():
+        file_match = _POST_IMAGE_HEADER.match(line)
+        if file_match:
+            current_file = _diff_header_path(file_match.group(1))
+            continue
+
+        hunk_match = hunk_pattern.match(line)
+        if hunk_match and current_file is not None:
+            start = int(hunk_match.group(1))
+            count = int(hunk_match.group(2)) if hunk_match.group(2) else 1
+            if count == 0:
+                # Pure deletion hunk (no lines added); still note the position.
+                end = start
+            else:
+                end = start + count - 1
+            ranges.setdefault(current_file, []).append((start, end))
+
+    return ranges
+
+
+def map_changes_to_nodes(session, changed_ranges: Dict[str, List[Tuple[int, int]]]) -> List[dict]:
+    """Return Function/Class node dicts whose [line_number, end_line] overlaps a changed range.
+
+    Queries CGC's graph directly via ``session`` (one Cypher call per changed
+    file) rather than code-review-graph's ``GraphStore.get_nodes_by_file``,
+    which has no equivalent here. Exact-path match only: CGC's indexing
+    pipeline writes a single consistent path form per file, unlike the
+    original project's broader cross-tool compatibility surface, so the
+    suffix-match fallback the original also has is deliberately not ported.
+    """
+    cypher = """
+    MATCH (n)
+    WHERE n.path = $file_path AND (n:Function OR n:Class)
+    RETURN n.uid, n.name, n.path, n.line_number, n.end_line
+    """
+    matched: List[dict] = []
+    for file_path, ranges in changed_ranges.items():
+        result = session.run(cypher, file_path=file_path)
+        for row in result:
+            line_start = row["n.line_number"]
+            line_end = row["n.end_line"]
+            if line_start is None or line_end is None:
+                continue
+            for start, end in ranges:
+                if line_start <= end and line_end >= start:
+                    matched.append({
+                        "uid": row["n.uid"],
+                        "name": row["n.name"],
+                        "path": row["n.path"],
+                        "line_number": line_start,
+                        "end_line": line_end,
+                    })
+                    break
+    return matched

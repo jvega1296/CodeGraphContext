@@ -9,13 +9,24 @@ one deliberate exception: `pytest-mock`'s `mocker` fixture is used for the
 hand-written stubs. Every other assertion in this file stays on the
 hand-rolled convention.
 
-`_fts5_conn` is also patched in every test that reaches the FTS5 branch:
-left unmocked, it would call the real `resolve_context()` (environment- and
+`_fts5_conn` is also patched in most tests that reach the FTS5 branch: left
+unmocked, it would call the real `resolve_context()` (environment- and
 cwd-dependent, and capable of creating a real `.codegraphcontext/` directory
 as a side effect in per-repo mode) purely to produce a connection object
 that the mocked `fts5_search` never actually touches. Patching it keeps
-these tests deterministic and side-effect-free without weakening any
+those tests deterministic and side-effect-free without weakening any
 assertion the brief specifies.
+
+One test --
+`test_search_code_cascade_falls_through_to_semantic_when_fts5_sidecar_was_never_built`
+-- deliberately does the opposite: it stubs only `resolve_context` (pointed
+at a pytest `tmp_path`) and exercises the real `_fts5_conn` ->
+`fts5_db_path` -> `sqlite3.connect` -> `fts5_search` chain against a
+sidecar that was never indexed, proving `fts5_search`'s missing-table
+guard (added for Task 21 review concern #2) makes the cascade's most
+common real-world case -- `ENABLE_FTS5_INDEX` left at its `false` default
+-- actually fall through to the semantic tier end-to-end, not just in
+`search_fts5.py`'s own isolated unit test.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -254,6 +265,48 @@ def test_search_code_cascade_falls_through_to_semantic_when_fts5_finds_nothing(m
     mocker.patch("codegraphcontext.tools.search_cascade.fts5_search", return_value=[])
     fake_embedder = object()
     mocker.patch("codegraphcontext.tools.search_cascade._get_embedder", return_value=fake_embedder)
+    semantic_spy = mocker.patch(
+        "codegraphcontext.tools.search_cascade.semantic_search",
+        return_value=[("uid-2", 0.83)],
+    )
+
+    res = search_code_cascade(code_finder, "order placement flow")
+
+    assert res["tier_used"] == "semantic"
+    semantic_spy.assert_called_once()
+
+
+def test_search_code_cascade_falls_through_to_semantic_when_fts5_sidecar_was_never_built(mocker, tmp_path):
+    """More end-to-end than the test above: exercises the REAL _fts5_conn ->
+    fts5_db_path -> sqlite3.connect -> fts5_search chain against a sidecar
+    that was never indexed (ENABLE_FTS5_INDEX defaults to false, so this is
+    the common case). Only `resolve_context` is stubbed -- not `_fts5_conn`
+    itself -- specifically so `fts5_search`'s own missing-table guard
+    (search_fts5.py's `sqlite3.OperationalError` handling) is what actually
+    produces the fallthrough here, proving that fix closes the cascade's
+    real-world "FTS5 never turned on" gap end-to-end rather than only in
+    search_fts5.py's own isolated unit test.
+
+    `resolve_context` is stubbed (rather than left real) only because its
+    real implementation can create a `.codegraphcontext/` directory as a
+    cwd-dependent side effect in `per-repo` mode -- unrelated to the
+    missing-table fix itself; see this file's module docstring.
+    `semantic_search`/`_get_embedder` are mocked because they need a real
+    embedder and a populated graph this unit test doesn't have.
+    """
+
+    class _FakeResolvedContext:
+        db_path = str(tmp_path / "ladybugdb")  # parent (tmp_path) always exists
+
+    mocker.patch(
+        "codegraphcontext.cli.config_manager.resolve_context",
+        return_value=_FakeResolvedContext(),
+    )
+    assert not (tmp_path / "search_fts5.sqlite").exists()  # sidecar genuinely never built
+
+    session = _FakeSession(rows=[{"n": {"uid": "uid-2", "name": "placeOrder", "path": "/repo/place.py", "_label": "Function"}}])
+    code_finder = _FakeCodeFinder(_no_match_result("order placement flow"), session=session)
+    mocker.patch("codegraphcontext.tools.search_cascade._get_embedder", return_value=object())
     semantic_spy = mocker.patch(
         "codegraphcontext.tools.search_cascade.semantic_search",
         return_value=[("uid-2", 0.83)],

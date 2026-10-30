@@ -186,6 +186,19 @@ def test_fts5_search_respects_limit(populated_fts5_conn):
     assert len(results) == 1
 
 
+def test_fts5_search_returns_empty_list_when_nodes_fts_table_is_missing():
+    """ENABLE_FTS5_INDEX defaults to false, so a sidecar with no nodes_fts
+    table at all (e.g. a freshly `sqlite3.connect`-ed path that was never
+    indexed) is the common case, not an edge case. fts5_search must degrade
+    gracefully rather than let sqlite3.OperationalError('no such table:
+    nodes_fts') escape -- mirrors code_review_graph's own `_fts_search`
+    guard (`try/except sqlite3.OperationalError: return []`), which this
+    port dropped because every other test in this file pre-creates the
+    schema via `ensure_fts5_schema` first (#task-21-concern-2)."""
+    conn = sqlite3.connect(":memory:")  # ensure_fts5_schema deliberately not called
+    assert fts5_search(conn, "createOrder") == []
+
+
 def test_fts_column_weights_align_with_live_schema_column_order(populated_fts5_conn):
     """Regression guard for the exact silent-misalignment risk the brief calls
     out: bm25()'s weight arguments map positionally to EVERY declared column

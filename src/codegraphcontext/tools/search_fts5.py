@@ -12,7 +12,7 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from ..utils.debug_log import info_logger
+from ..utils.debug_log import info_logger, warning_logger
 
 # Weights for bm25() ranking, keyed by column name. Only the columns a query
 # should actually favor need an entry; any column missing from this dict
@@ -143,11 +143,25 @@ def fts5_search(conn: sqlite3.Connection, query: str, limit: int = 20) -> List[T
     matches. Order ascending on the raw value in SQL (so the best match is
     already first), then negate each score in Python after fetching, so
     callers see "higher score = better match" without re-sorting.
+
+    ``ENABLE_FTS5_INDEX`` defaults to ``false``, so a sidecar connection
+    with no ``nodes_fts`` table at all is the common case, not an edge
+    case -- the same guard code-review-graph's own ``_fts_search`` already
+    carries. ``PRAGMA table_info`` on a missing table returns zero rows
+    rather than raising, so ``_fts_column_weights`` silently yields an
+    empty weights string first; the actual ``sqlite3.OperationalError``
+    (``no such table: nodes_fts``, surfaced here as a malformed
+    ``bm25(nodes_fts, )`` call) only fires once the query itself executes.
+    Catching around the whole body covers that real failure point.
     """
-    weights = _fts_column_weights(conn)
-    sql = (
-        f"SELECT uid, bm25(nodes_fts, {weights}) AS score FROM nodes_fts "
-        "WHERE nodes_fts MATCH ? ORDER BY score LIMIT ?"
-    )
-    rows = conn.execute(sql, (query, limit)).fetchall()
+    try:
+        weights = _fts_column_weights(conn)
+        sql = (
+            f"SELECT uid, bm25(nodes_fts, {weights}) AS score FROM nodes_fts "
+            "WHERE nodes_fts MATCH ? ORDER BY score LIMIT ?"
+        )
+        rows = conn.execute(sql, (query, limit)).fetchall()
+    except sqlite3.OperationalError as exc:
+        warning_logger(f"[FTS5] lexical search unavailable: {exc}")
+        return []
     return [(row[0], -row[1]) for row in rows]

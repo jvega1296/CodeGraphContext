@@ -121,7 +121,7 @@ def extract_from_source(
         return result
 
     module = _module_name(path)
-    path_str = str(path)
+    path_str = Path(path).as_posix()
 
     def _emit(off: int, method_verb: str, raw_path: str, framework: str, provenance_extra: str = "") -> None:
         after = source[off:]

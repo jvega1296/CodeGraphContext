@@ -405,7 +405,7 @@ def extract_from_source(
         return f"{prefix}{span.name}.{method}"
 
     consts_cache = {}
-    path_str = str(path)
+    path_str = Path(path).as_posix()
 
     # ── Server: @Get/PostMapping etc. ────────────────────────────────────
     for m in _MAPPING_RE.finditer(source):

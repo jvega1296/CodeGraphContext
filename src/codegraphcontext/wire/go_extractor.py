@@ -101,7 +101,7 @@ def extract_from_source(
         return result
 
     pkg = _package(source) or ""
-    path_str = str(path)
+    path_str = Path(path).as_posix()
 
     def _emit(off: int, verb: str, raw_path: str, handler: str, framework: str, prov: str) -> None:
         # Handler in Go is typically `handleFoo` or `pkg.Handler` or a struct method.

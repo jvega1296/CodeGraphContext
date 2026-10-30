@@ -522,7 +522,7 @@ def extract_from_source(
         result.warnings.append(f"{path}: no top-level class/interface found; skipping")
         return result
 
-    path_str = str(path)
+    path_str = Path(path).as_posix()
     # Cache in-class constants per span so we do not re-scan for every hit.
     class_consts_cache: dict = {}
 

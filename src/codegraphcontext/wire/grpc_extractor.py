@@ -241,7 +241,7 @@ def extract_from_source(
         prefix = f"{pkg}." if pkg else ""
         return f"{prefix}{span.name}.{method}"
 
-    path_str = str(path)
+    path_str = Path(path).as_posix()
 
     # ── Server RPCs ──────────────────────────────────────────────────────
     for span in impl_spans:

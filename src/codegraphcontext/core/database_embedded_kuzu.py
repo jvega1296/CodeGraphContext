@@ -328,7 +328,11 @@ class EmbeddedGraphManager(GraphQueryInterface):
             # service_account is backfilled later by Piece 3's Terraform
             # stitching step (terraform_stitcher.py) -- never known from
             # application code alone, so it is not part of the natural key.
-            ("Subscription", "uid STRING, name STRING, project_id STRING, service_account STRING, PRIMARY KEY (uid)")
+            ("Subscription", "uid STRING, name STRING, project_id STRING, service_account STRING, PRIMARY KEY (uid)"),
+            # Sync wire address (REST/gRPC, pre-existing PR #1728 feature) --
+            # composite natural key (protocol+method+path), synthesized uid
+            # like Topic/Subscription above.
+            ("Endpoint", "uid STRING, protocol STRING, method STRING, path STRING, PRIMARY KEY (uid)")
         ]
         
         # rel_tables: list of (table_name, schema, use_group)
@@ -434,6 +438,37 @@ class EmbeddedGraphManager(GraphQueryInterface):
             # Wire-coupling edges (MULTI_REPO_LINKS, Piece 1/3).
             ("HAS_SUBSCRIPTION", "FROM Topic TO Subscription", False),
             ("BACKED_BY", "FROM Topic TO Class, FROM Subscription TO Class", True),
+            # Function -> Topic (Kafka/SQS/Rabbit/PubSub producer); File -> Topic
+            # is the config-anchored variant for records with no Java call site
+            # (writer.py's _MERGE_PRODUCES_TO_FILE). Previously undeclared on
+            # this backend, so any MULTI_REPO_LINKS=true index run failed with
+            # "Binder exception: Table PRODUCES_TO does not exist" the moment a
+            # producer/consumer was found.
+            ("PRODUCES_TO", """
+                FROM Function TO Topic, FROM File TO Topic,
+                call_line INT64, match_confidence STRING, provenance STRING,
+                call_shape STRING, topic_raw STRING, source_file STRING, anchor STRING
+            """, True),
+            # Function -> Topic (listener bindings) / Function -> Subscription
+            # (Pub/Sub consumer, writer.py's _MERGE_CONSUMES_FROM_SUBSCRIPTION);
+            # File -> Topic is the config-anchored variant, mirroring PRODUCES_TO.
+            ("CONSUMES_FROM", """
+                FROM Function TO Topic, FROM File TO Topic, FROM Function TO Subscription,
+                call_line INT64, match_confidence STRING, provenance STRING,
+                is_pattern BOOLEAN, topic_raw STRING, source_file STRING, anchor STRING
+            """, True),
+            # Function -> Endpoint (HTTP handler / gRPC ImplBase override).
+            ("SERVES", """
+                FROM Function TO Endpoint,
+                call_line INT64, match_confidence STRING, provenance STRING,
+                framework STRING, source_file STRING
+            """, False),
+            # Function -> Endpoint (RestTemplate / WebClient / Feign / gRPC stub).
+            ("INVOKES", """
+                FROM Function TO Endpoint,
+                call_line INT64, match_confidence STRING, provenance STRING,
+                framework STRING, source_file STRING
+            """, False),
         ]
 
         # Legacy Kùzu databases may carry a DbTable created with PRIMARY KEY
@@ -815,6 +850,7 @@ class EmbeddedSessionWrapper:
             'ExternalLibrary': ['group_id', 'artifact_id'],
             'Topic': ['system', 'name'],
             'Subscription': ['name', 'project_id'],
+            'Endpoint': ['protocol', 'method', 'path'],
         }
     
     def __enter__(self):
@@ -1217,6 +1253,7 @@ class EmbeddedSessionWrapper:
             'Object': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'is_dependency', 'decorators', 'visibility', 'modifiers'},
             'Topic': {'uid', 'system', 'name'},
             'Subscription': {'uid', 'name', 'project_id', 'service_account'},
+            'Endpoint': {'uid', 'protocol', 'method', 'path'},
         }
 
         # 1. Translate SET n += $props  and  SET n = $props  (map merge/assign)

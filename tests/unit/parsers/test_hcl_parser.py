@@ -12,6 +12,7 @@ to the file that writes it is resolved against that file, because `../..` and
 `${get_terragrunt_dir()}/../this` name something different from every file.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -223,3 +224,28 @@ def test_module_block_with_topic_attribute_captures_it_as_a_property(parser, tmp
     result = parse(parser, tmp_path, "pubsub.tf", source)
     module_node = next(c for c in result["classes"] if c["name"].endswith("oms_order_event_pubsub_config"))
     assert module_node["topic"] == "oms-order-create-event"
+
+
+def test_pull_subscriptions_object_list_captures_name_and_service_account(tmp_path, parser):
+    source = """
+    module "oms_order_event_pubsub_config" {
+      topic = "oms-order-create-event"
+      pull_subscriptions = [
+        { name = "oms_order_create_pull_subscription", service_account = "oms-order-consumer-sa@azdv1-ordfl-ordrmgmt.iam.gserviceaccount.com" }
+      ]
+    }
+    """
+    result = parse(parser, tmp_path, "pubsub.tf", source)
+    module_node = next(c for c in result["classes"] if c["name"].endswith("oms_order_event_pubsub_config"))
+    subs = json.loads(module_node["pull_subscriptions"])
+    assert subs == [{"name": "oms_order_create_pull_subscription",
+                      "service_account": "oms-order-consumer-sa@azdv1-ordfl-ordrmgmt.iam.gserviceaccount.com"}]
+
+
+def test_string_element_list_still_works_after_object_list_support_added(parser, tmp_path):
+    """Re-running TestTerragruntDependencies's fixture/assertion unchanged: adding object-list
+    support to a sibling helper must not disturb the existing string-list walk in _literals()."""
+    source = 'dependencies {\n  paths = ["../vpc", "../db", local.computed]\n}\n'
+    names = {i["name"] for i in parse(parser, tmp_path, "terragrunt.hcl", source)["imports"]}
+    assert {(tmp_path.parent / "vpc").resolve().as_posix(),
+            (tmp_path.parent / "db").resolve().as_posix()} == names

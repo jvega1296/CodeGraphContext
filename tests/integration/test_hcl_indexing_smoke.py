@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 from pathlib import Path
 
@@ -161,5 +162,56 @@ def test_hcl_pubsub_module_topic_attribute_lands_as_queryable_property(tmp_path)
             ).data()
             assert len(rows) == 1
             assert rows[0]["name"] == "module.oms_order_event_pubsub_config"
+    finally:
+        manager.close_driver()
+
+
+@pytest.mark.integration
+def test_hcl_pubsub_module_pull_subscriptions_lands_as_queryable_property(tmp_path):
+    """A module's `pull_subscriptions` is a list of objects, not a single string, so it is
+    pre-serialized to JSON before it reaches the embedded backend -- it needs its own declared
+    column the same way `topic` does, or it is silently dropped before storage."""
+    if not get_tree_sitter_manager().is_language_available("hcl"):
+        pytest.skip("HCL tree-sitter grammar is not available")
+
+    repo = tmp_path / "pubsub_repo"
+    repo.mkdir()
+    (repo / "pubsub.tf").write_text(
+        """
+        module "oms_order_event_pubsub_config" {
+          topic = "oms-order-create-event"
+          pull_subscriptions = [
+            { name = "oms_order_create_pull_subscription", service_account = "oms-order-consumer-sa@azdv1-ordfl-ordrmgmt.iam.gserviceaccount.com" }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    manager = _fresh_kuzu_manager(tmp_path / "kuzu-db")
+    try:
+        job_manager = JobManager()
+
+        async def index_fixture() -> str:
+            builder = GraphBuilder(manager, job_manager, asyncio.get_running_loop())
+            job_id = job_manager.create_job(str(repo), is_dependency=False)
+            await builder.build_graph_from_path_async(repo, job_id=job_id)
+            return job_id
+
+        job = job_manager.get_job(asyncio.run(index_fixture()))
+        assert job is not None
+        assert job.status == JobStatus.COMPLETED
+
+        with manager.get_driver().session() as session:
+            rows = session.run(
+                "MATCH (c:Class) WHERE c.topic = 'oms-order-create-event' "
+                "RETURN c.name AS name, c.pull_subscriptions AS pull_subscriptions"
+            ).data()
+            assert len(rows) == 1
+            subs = json.loads(rows[0]["pull_subscriptions"])
+            assert subs == [{
+                "name": "oms_order_create_pull_subscription",
+                "service_account": "oms-order-consumer-sa@azdv1-ordfl-ordrmgmt.iam.gserviceaccount.com",
+            }]
     finally:
         manager.close_driver()

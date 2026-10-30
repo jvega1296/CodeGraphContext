@@ -10,6 +10,7 @@ Terragrunt `terraform { source }`, `include { path }`, `dependency { config_path
 consume this module" is a graph query.
 """
 
+import json
 import re
 import textwrap
 from pathlib import Path
@@ -121,6 +122,61 @@ class HclTreeSitterParser:
                     found.append(value)
         return found
 
+    def _object_key(self, expression) -> Optional[str]:
+        """The bare identifier naming one side of an object literal's `key = value` pair
+        (`{ name = "x" }`), where the key is wrapped as its own `variable_expr` instead of
+        appearing as a plain `identifier` sibling the way an `attribute` node's key does."""
+        if expression is None or expression.child_count != 1:
+            return None
+        variable_expr = expression.children[0]
+        if variable_expr.type != "variable_expr" or variable_expr.child_count != 1:
+            return None
+        identifier = variable_expr.children[0]
+        return self._text(identifier) if identifier.type == "identifier" else None
+
+    def _object_elements(self, obj) -> Dict[str, Optional[str]]:
+        """The key/value pairs of one HCL object literal (`{ k = v, ... }`), as a dict of
+        their string-valued values. An object's pairs are `object_elem` nodes, each holding
+        exactly two `expression` children (key, then value) in document order -- unlike a
+        body's `attribute` nodes, whose key is a bare `identifier`, not an `expression`."""
+        pairs: Dict[str, Optional[str]] = {}
+        for child in obj.children:
+            if child.type != "object_elem":
+                continue
+            expressions = [c for c in child.children if c.type == "expression"]
+            if len(expressions) != 2:
+                continue
+            key_expression, value_expression = expressions
+            key = self._object_key(key_expression)
+            if key is not None:
+                pairs[key] = self._string(value_expression)
+        return pairs
+
+    def _object_list(self, attribute) -> List[Dict[str, Optional[str]]]:
+        """Each element of a list-of-objects attribute such as
+        `pull_subscriptions = [{ name = "x", service_account = "y" }]`, as a dict of its
+        string-valued keys. Walks the same collection_value -> tuple structure _literals()
+        walks, but recurses into an element whose expression wraps an object literal instead
+        of treating every element as an opaque string."""
+        expression = self._expression(attribute)
+        collection = expression.children[0] if expression is not None and expression.child_count == 1 else None
+        if collection is None or collection.type != "collection_value":
+            return []
+        found: List[Dict[str, Optional[str]]] = []
+        for sequence in collection.children:
+            if sequence.type != "tuple":
+                continue
+            for element in sequence.children:
+                if element.type != "expression" or element.child_count != 1:
+                    continue
+                inner = element.children[0]
+                if inner.type != "collection_value" or inner.child_count != 1:
+                    continue
+                obj = inner.children[0]
+                if obj.type == "object":
+                    found.append(self._object_elements(obj))
+        return found
+
     def _address(self, block_type: str, labels: List[str]) -> str:
         if block_type in _TYPE_AND_NAME_BLOCKS and len(labels) >= 2:
             address = ".".join(labels[:2])
@@ -164,6 +220,11 @@ class HclTreeSitterParser:
             # one: an expression would store code where a reader expects prose.
             "docstring": self._literal(attributes.get("description")),
             "topic": self._literal(attributes.get("topic")),
+            # Pre-serialized to a JSON string here rather than left as a list: the writer's
+            # batch type-coercion infers a column's type from the dominant value type across
+            # a batch, and would coerce a list-typed property back into a JSON string anyway --
+            # storing it this way avoids depending on that inference running as expected.
+            "pull_subscriptions": json.dumps(self._object_list(attributes.get("pull_subscriptions"))),
         }
         if self.index_source:
             node["source"] = self._text(block)

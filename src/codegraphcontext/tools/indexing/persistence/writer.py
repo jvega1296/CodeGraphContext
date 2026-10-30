@@ -2483,7 +2483,28 @@ class GraphWriter:
                         path=repo_path_str,
                     ).single()
                     return result["deleted"] if result else 0
-                deleted = execute_write_operation(self.driver, backend, _work)
+                try:
+                    deleted = execute_write_operation(self.driver, backend, _work)
+                except Exception as e:
+                    # Some node labels (e.g. Topic/Subscription -- wire-
+                    # coupling identities shared across every repo that
+                    # produces/consumes them, keyed by name rather than file
+                    # path, see schema_contract.TOPIC_MERGE_KEYS) have no
+                    # `path` column at all on Kùzu/LadybugDB's strict
+                    # per-label schema, so this generic per-repo query cannot
+                    # even be bound there -- correctly so, since a Topic a
+                    # DIFFERENT repo still produces/consumes must never be
+                    # deleted just because this one repo is being
+                    # re-indexed. Any orphaned pathless node left with no
+                    # more edges once this repo's Function/File nodes are
+                    # gone is instead cleaned up by
+                    # _purge_dangling_pathless_nodes below. On Neo4j/FalkorDB
+                    # (schemaless) this label's nodes simply have no `path`
+                    # property and the query harmlessly matches nothing, so
+                    # this path is Kùzu/LadybugDB-specific in practice.
+                    if _is_binder_exception(e):
+                        break
+                    raise
                 if deleted == 0:
                     break
                 info_logger(f"[DELETE] Removed {deleted} {label} nodes for {repo_path_str}")
@@ -2520,6 +2541,27 @@ DETACH DELETE r, n
             (
                 "MATCH (p:Parameter) WHERE NOT ()-[:HAS_PARAMETER]->(p) "
                 "WITH p LIMIT 5000 DETACH DELETE p RETURN count(p) AS deleted"
+            ),
+            # Wire-coupling identities (Topic/Subscription/Endpoint) have no
+            # `path` and are legitimately shared across every repo that
+            # produces/consumes them -- delete_repository_from_graph's
+            # per-repo path-scoped deletion above skips them entirely for
+            # exactly that reason. "No edges in EITHER direction" (not just
+            # incoming) is required here: a Topic can still carry an
+            # outgoing BACKED_BY from Terraform stitching after its last
+            # producer/consumer Function was deleted, and that is not yet
+            # orphaned.
+            (
+                "MATCH (n:Topic) WHERE NOT ()-[]->(n) AND NOT (n)-[]->() "
+                "WITH n LIMIT 5000 DETACH DELETE n RETURN count(n) AS deleted"
+            ),
+            (
+                "MATCH (n:Subscription) WHERE NOT ()-[]->(n) AND NOT (n)-[]->() "
+                "WITH n LIMIT 5000 DETACH DELETE n RETURN count(n) AS deleted"
+            ),
+            (
+                "MATCH (n:Endpoint) WHERE NOT ()-[]->(n) AND NOT (n)-[]->() "
+                "WITH n LIMIT 5000 DETACH DELETE n RETURN count(n) AS deleted"
             ),
         ]
         for query in dangling_queries:

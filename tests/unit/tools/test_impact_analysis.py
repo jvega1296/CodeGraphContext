@@ -55,6 +55,8 @@ class _FakeSession:
                 return _FakeResult([{"uid": "func_publish_inventory_audit", "name": "publishInventoryAudit", "path": "src/inventory.py", "labels": ["Function"]}])
             if kwargs.get("target") == "onOrderCreateEvent":
                 return _FakeResult([{"uid": "func_on_order_create", "name": "onOrderCreateEvent", "path": "src/oms-order-consumer/OrderCreateListener.java", "labels": ["Function"]}])
+            if kwargs.get("target") == "consumeOrphanEvent":
+                return _FakeResult([{"uid": "func_consume_orphan_event", "name": "consumeOrphanEvent", "path": "src/oms-order-consumer/OrphanEventListener.java", "labels": ["Function"]}])
             return _FakeResult([])
             
         elif "MATCH p = (source)-[:CALLS" in query:
@@ -126,8 +128,13 @@ class _FakeSession:
             return _FakeResult([])
 
         elif "NOT (x)<-[:PRODUCES_TO]-()" in query:
-            # Upstream Query D (dead-end detection): no consumer frontier in
-            # these fixtures reaches a subscription/topic with no producer.
+            # Upstream Query D (dead-end detection): only the orphan-event
+            # consumer frontier reaches a subscription/topic with no
+            # producer indexed anywhere upstream of it.
+            if "func_consume_orphan_event" in kwargs.get("frontier_uids", []):
+                return _FakeResult([
+                    {"topic_name": "orphan-event-topic"}
+                ])
             return _FakeResult([])
 
         elif "CONSUMES_FROM]->(s:Subscription)<-[:HAS_SUBSCRIPTION]" in query:
@@ -246,6 +253,11 @@ def test_analyze_impact_upstream_crosses_pubsub_subscription_to_producer_repo():
     res = finder.analyze_impact(target="onOrderCreateEvent", direction="upstream", max_wire_hops=2)
     node_paths = {n["path"] for n in res["affected_nodes"]}
     assert any("special-order-services" in p for p in node_paths), "producer repo missing from upstream trace"
+
+def test_upstream_trace_reports_unresolved_crossing_for_dead_end_topic():
+    finder, recorder = _make_finder()
+    res = finder.analyze_impact(target="consumeOrphanEvent", direction="upstream")
+    assert any(c["topic"] == "orphan-event-topic" for c in res["unresolved_crossings"])
 
 @pytest.mark.parametrize("backend", ["neo4j", "falkordb"])
 def test_portable_field_helpers_handle_real_driver_objects(backend):

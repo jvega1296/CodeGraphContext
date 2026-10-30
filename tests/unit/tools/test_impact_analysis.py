@@ -53,6 +53,8 @@ class _FakeSession:
                 return _FakeResult([{"uid": "func_create_order", "name": "createOrder", "path": "src/orders.py", "labels": ["Function"]}])
             if kwargs.get("target") == "publishInventoryAudit":
                 return _FakeResult([{"uid": "func_publish_inventory_audit", "name": "publishInventoryAudit", "path": "src/inventory.py", "labels": ["Function"]}])
+            if kwargs.get("target") == "onOrderCreateEvent":
+                return _FakeResult([{"uid": "func_on_order_create", "name": "onOrderCreateEvent", "path": "src/oms-order-consumer/OrderCreateListener.java", "labels": ["Function"]}])
             return _FakeResult([])
             
         elif "MATCH p = (source)-[:CALLS" in query:
@@ -121,6 +123,34 @@ class _FakeSession:
 
         elif "MATCH (fn)-[:SERVES]->(ep:Endpoint)" in query:
             # Query C: SERVES/INVOKES bridge through Endpoint.
+            return _FakeResult([])
+
+        elif "NOT (x)<-[:PRODUCES_TO]-()" in query:
+            # Upstream Query D (dead-end detection): no consumer frontier in
+            # these fixtures reaches a subscription/topic with no producer.
+            return _FakeResult([])
+
+        elif "CONSUMES_FROM]->(s:Subscription)<-[:HAS_SUBSCRIPTION]" in query:
+            # Upstream Query A: consumer -> subscription -> topic -> producer.
+            if "func_on_order_create" in kwargs.get("frontier_uids", []):
+                return _FakeResult([
+                    {
+                        "producer_uid": "func_on_order_create",
+                        "topic_name": "oms-order-create-event",
+                        "subscription_name": "oms-order-create-pull-subscription",
+                        "consumer_uid": "func_create_order",
+                        "consumer_name": "createOrder",
+                        "consumer_path": "src/special-order-services/CreateOrderPublisher.java",
+                    }
+                ])
+            return _FakeResult([])
+
+        elif "CONSUMES_FROM]->(t:Topic)<-[:PRODUCES_TO]" in query:
+            # Upstream Query B: consumer -> topic -> producer (no Subscription node).
+            return _FakeResult([])
+
+        elif "MATCH (caller_fn)-[:INVOKES]->(ep:Endpoint)" in query:
+            # Upstream Query C: INVOKES/SERVES bridge through Endpoint.
             return _FakeResult([])
 
         return _FakeResult([])
@@ -210,6 +240,12 @@ def test_downstream_trace_reports_unresolved_crossing_for_dead_end_topic():
     finder, recorder = _make_finder()
     res = finder.analyze_impact(target="publishInventoryAudit", direction="downstream")
     assert any(c["topic"] == "order-inv-inquiry-oms-leg-analysis-event" for c in res["unresolved_crossings"])
+
+def test_analyze_impact_upstream_crosses_pubsub_subscription_to_producer_repo():
+    finder, recorder = _make_finder()
+    res = finder.analyze_impact(target="onOrderCreateEvent", direction="upstream", max_wire_hops=2)
+    node_paths = {n["path"] for n in res["affected_nodes"]}
+    assert any("special-order-services" in p for p in node_paths), "producer repo missing from upstream trace"
 
 @pytest.mark.parametrize("backend", ["neo4j", "falkordb"])
 def test_portable_field_helpers_handle_real_driver_objects(backend):

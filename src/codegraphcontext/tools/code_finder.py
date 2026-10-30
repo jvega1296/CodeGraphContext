@@ -298,6 +298,60 @@ _BRIDGE_DEAD_END_TOPIC = """
     RETURN DISTINCT t.name as topic_name
 """
 
+# Upstream wire-bridging (Task 8): the exact mirror of the three queries
+# above with every arrow reversed, so the frontier is matched on the
+# *consumer*/caller side of each wire edge and the function discovered on
+# the other side is the one that publishes the event or serves the
+# endpoint. CONSUMES_FROM targets either a Subscription node (when a
+# Subscription scanner matched it) or a Topic node directly (see
+# wire/writer.py's ``_MERGE_CONSUMES_FROM``/``_MERGE_CONSUMES_FROM_SUBSCRIPTION``),
+# so -- exactly like the downstream pair above -- this needs two separate
+# queries rather than one, to keep each Cypher shape simple.
+#
+# Returned fragment columns deliberately keep the same
+# producer_uid/topic_name/subscription_name/consumer_uid/consumer_name/
+# consumer_path names as the downstream queries: ``producer_uid`` is always
+# the already-known frontier-side function and ``consumer_uid``/
+# ``consumer_name``/``consumer_path`` the newly-discovered one, regardless
+# of which side is semantically the "producer" here -- the same
+# reuse-over-rename convention ``_BRIDGE_ENDPOINT_SERVES_INVOKES`` already
+# established for the REST crossing, so ``analyze_impact``'s BFS loop
+# processes either direction's rows identically.
+_BRIDGE_CONSUMER_TO_SUBSCRIPTION_PRODUCER = """
+    MATCH (consumer_fn)-[:CONSUMES_FROM]->(s:Subscription)<-[:HAS_SUBSCRIPTION]-(t:Topic)<-[:PRODUCES_TO]-(fn)
+    WHERE consumer_fn.uid IN $frontier_uids
+    RETURN consumer_fn.uid as producer_uid, t.name as topic_name, s.name as subscription_name,
+           fn.uid as consumer_uid, fn.name as consumer_name, fn.path as consumer_path
+"""
+
+_BRIDGE_CONSUMER_TO_TOPIC_PRODUCER = """
+    MATCH (consumer_fn)-[:CONSUMES_FROM]->(t:Topic)<-[:PRODUCES_TO]-(fn)
+    WHERE consumer_fn.uid IN $frontier_uids AND NOT (t)-[:HAS_SUBSCRIPTION]->()
+    RETURN consumer_fn.uid as producer_uid, t.name as topic_name, null as subscription_name,
+           fn.uid as consumer_uid, fn.name as consumer_name, fn.path as consumer_path
+"""
+
+_BRIDGE_ENDPOINT_INVOKES_SERVES = """
+    MATCH (caller_fn)-[:INVOKES]->(ep:Endpoint)<-[:SERVES]-(fn)
+    WHERE caller_fn.uid IN $frontier_uids
+    RETURN caller_fn.uid as producer_uid, ep.path as topic_name, null as subscription_name,
+           fn.uid as consumer_uid, fn.name as consumer_name, fn.path as consumer_path
+"""
+
+# Mirrors _BRIDGE_DEAD_END_TOPIC: a subscription/topic the frontier consumes
+# from with no producer indexed anywhere upstream of it -- on either the
+# Subscription-mediated or direct-Topic path -- is a true dead end, reported
+# in unresolved_crossings. ``(x)`` matches either node type (CONSUMES_FROM's
+# target varies, same as above), so one query covers both cases the same
+# way the two resolver queries above do with two separate MATCHes.
+_BRIDGE_DEAD_END_CONSUMER_WITH_NO_PRODUCER = """
+    MATCH (consumer_fn)-[:CONSUMES_FROM]->(x)
+    WHERE consumer_fn.uid IN $frontier_uids
+      AND NOT (x)<-[:HAS_SUBSCRIPTION]-(:Topic)<-[:PRODUCES_TO]-()
+      AND NOT (x)<-[:PRODUCES_TO]-()
+    RETURN DISTINCT x.name as topic_name
+"""
+
 
 def _levenshtein_distance(a: str, b: str) -> int:
     """Levenshtein distance for short identifiers (typo-tolerant name search)."""
@@ -2073,6 +2127,56 @@ class CodeFinder:
 
         return new_path_fragments, newly_discovered_uids, unresolved_crossings
 
+    def _bridge_upstream(
+        self, session, frontier_uids: List[str],
+    ) -> Tuple[List[dict], List[str], List[dict]]:
+        """Cross upstream wire edges (Pub/Sub subscription/topic, REST
+        endpoint) from a frontier of function uids into whatever function(s)
+        originate them on the other side of the wire.
+
+        Mirrors ``_bridge_downstream`` with every bridge-query arrow
+        reversed: the frontier is matched on the *consumer*/caller side of
+        each wire edge, and the function discovered on the other side is the
+        one that publishes the event or serves the endpoint.
+
+        Returns ``(new_path_fragments, newly_discovered_function_uids,
+        unresolved_crossings)`` -- the exact same shape as
+        ``_bridge_downstream``. Each fragment's ``producer_uid`` is always
+        the already-known frontier-side function and ``consumer_uid``/
+        ``consumer_name``/``consumer_path`` the newly-discovered one,
+        regardless of which side is semantically the "producer" -- see the
+        module-level comment above ``_BRIDGE_CONSUMER_TO_SUBSCRIPTION_PRODUCER``.
+        """
+        if not frontier_uids:
+            return [], [], []
+
+        new_path_fragments: List[dict] = []
+        newly_discovered_uids: List[str] = []
+        seen_uids: set = set()
+
+        for bridge_query in (
+            _BRIDGE_CONSUMER_TO_SUBSCRIPTION_PRODUCER,
+            _BRIDGE_CONSUMER_TO_TOPIC_PRODUCER,
+            _BRIDGE_ENDPOINT_INVOKES_SERVES,
+        ):
+            for row in session.run(bridge_query, frontier_uids=frontier_uids).data():
+                new_path_fragments.append(row)
+                consumer_uid = row.get("consumer_uid")
+                if consumer_uid and consumer_uid not in seen_uids:
+                    seen_uids.add(consumer_uid)
+                    newly_discovered_uids.append(consumer_uid)
+
+        unresolved_crossings: List[dict] = []
+        for row in session.run(
+            _BRIDGE_DEAD_END_CONSUMER_WITH_NO_PRODUCER, frontier_uids=frontier_uids
+        ).data():
+            unresolved_crossings.append({
+                "topic": row.get("topic_name"),
+                "reason": "no indexed producer function found for this topic/subscription",
+            })
+
+        return new_path_fragments, newly_discovered_uids, unresolved_crossings
+
     def analyze_impact(
         self,
         target: str,
@@ -2080,7 +2184,7 @@ class CodeFinder:
         repo_path: Optional[str] = None,
         depth: int = 3,
         direction: str = "upstream",
-        max_wire_hops: int = 2,  # downstream wire-bridging (Task 7); upstream is Task 8
+        max_wire_hops: int = 2,  # wire-bridging BFS depth, both directions (Tasks 7-8)
     ) -> Dict[str, Any]:
         """Analyze semantic code impact and propagation upstream or downstream."""
         import subprocess
@@ -2243,14 +2347,17 @@ class CodeFinder:
             res_prop = session.run(propagation_query, target_uids=target_uids)
             initial_leaf_uids = _apply_propagation_rows(res_prop)
 
-        # 2b. Downstream wire-bridging BFS (Task 7): cross PRODUCES_TO/
-        # CONSUMES_FROM (Pub/Sub) and SERVES/INVOKES (REST) wire edges into
-        # the repo(s) on the other side, then keep tracing the ordinary
-        # CALLS chain inside whatever function is found there. The frontier
-        # for the first wire-hop is the original target(s) themselves
-        # (a function can both call locally *and* publish directly) union
-        # the leaf nodes the in-repo propagation just reached. Upstream
-        # wire-bridging is Task 8's job, so this only runs downstream.
+        # 2b. Wire-bridging BFS: cross PRODUCES_TO/CONSUMES_FROM (Pub/Sub)
+        # and SERVES/INVOKES (REST) wire edges into the repo(s) on the other
+        # side, then keep tracing the ordinary CALLS chain inside whatever
+        # function is found there. The frontier for the first wire-hop is
+        # the original target(s) themselves (a function can both call
+        # locally *and* publish/consume directly) union the leaf nodes the
+        # in-repo propagation just reached. Downstream (Task 7) and upstream
+        # (Task 8) are two separate, deliberately-mirrored blocks below
+        # rather than one merged loop -- each matches the frontier on a
+        # different side of the wire edge and calls a different
+        # ``_bridge_*`` method, but otherwise the loop shape is identical.
         cross_repo_hops: List[Dict[str, Any]] = []
         unresolved_crossings: List[Dict[str, Any]] = []
         if direction == "downstream":
@@ -2291,6 +2398,49 @@ class CodeFinder:
                             # work should treat cross-repo depth as its own axis
                             # (e.g. cross_repo_hops length) rather than reading
                             # affected_nodes depth as a single unified distance.
+                            affected_nodes_map[consumer_uid] = {
+                                "uid": consumer_uid,
+                                "name": fragment.get("consumer_name"),
+                                "type": "Function",
+                                "path": fragment.get("consumer_path"),
+                                "depth": 0,
+                            }
+
+                    res_hop = session.run(propagation_query, target_uids=newly_discovered_uids)
+                    hop_leaf_uids = _apply_propagation_rows(res_hop)
+
+                    frontier = set(newly_discovered_uids) | set(hop_leaf_uids)
+        elif direction == "upstream":
+            max_wire_hops = _sanitize_wire_hops(max_wire_hops)
+            visited_frontier_uids: set = set()
+            frontier = set(target_uids) | set(initial_leaf_uids)
+            with self.driver.session() as session:
+                for _ in range(max_wire_hops):
+                    frontier -= visited_frontier_uids
+                    if not frontier:
+                        break
+                    visited_frontier_uids |= frontier
+
+                    fragments, newly_discovered_uids, hop_unresolved = self._bridge_upstream(
+                        session, list(frontier)
+                    )
+                    unresolved_crossings.extend(hop_unresolved)
+                    if not newly_discovered_uids:
+                        break
+
+                    for fragment in fragments:
+                        cross_repo_hops.append({
+                            "topic": fragment.get("topic_name"),
+                            "subscription": fragment.get("subscription_name"),
+                            "from_uid": fragment.get("producer_uid"),
+                            "to_uid": fragment.get("consumer_uid"),
+                            "to_name": fragment.get("consumer_name"),
+                            "to_path": fragment.get("consumer_path"),
+                        })
+                        consumer_uid = fragment.get("consumer_uid")
+                        if consumer_uid and consumer_uid not in affected_nodes_map:
+                            # see the matching comment in the downstream block
+                            # above -- depth resets to 0 at the wire crossing.
                             affected_nodes_map[consumer_uid] = {
                                 "uid": consumer_uid,
                                 "name": fragment.get("consumer_name"),

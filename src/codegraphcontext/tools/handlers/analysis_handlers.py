@@ -2,6 +2,7 @@
 from dataclasses import asdict
 from typing import Any, Dict
 from ..code_finder import CodeFinder
+from ..search_cascade import search_code_cascade
 from ...utils.debug_log import debug_log
 from ...utils.tool_limits import get_tool_result_limit
 
@@ -407,6 +408,36 @@ def analyze_change_risk(code_finder: CodeFinder, **args) -> Dict[str, Any]:
     except Exception as e:
         debug_log(f"Error analyzing change risk: {str(e)}")
         return {"error": f"Failed to analyze change risk: {str(e)}"}
+
+
+def search_code(code_finder: CodeFinder, **args) -> Dict[str, Any]:
+    """Tool to search code via the 3-tier cascade: exact Cypher match ->
+    SQLite FTS5 lexical fallback -> semantic embedding search (Piece 5,
+    Task 21). Use when an exact/fuzzy name match from 'find_code' may not
+    exist.
+
+    'repo_path' is accepted in the schema to match this codebase's other
+    search tools, but `search_code_cascade`'s fixed interface (Task 21's
+    plan) takes no repo_path -- its exact tier always searches the whole
+    index. Logged here for operator visibility; not forwarded further.
+    """
+    query = args.get("query")
+    if not query:
+        return {"error": "'query' is a required argument"}
+
+    limit = get_tool_result_limit("search_code", default=args.get("limit", 20))
+    repo_path = args.get("repo_path")
+
+    try:
+        debug_log(
+            f"Searching code (cascade) for query: {query}, limit={limit}, "
+            f"repo_path={repo_path} (not yet honored by search_code_cascade)"
+        )
+        result = search_code_cascade(code_finder, query, limit=limit)
+        return {"success": True, **result}
+    except Exception as e:
+        debug_log(f"Error searching code (cascade): {str(e)}")
+        return {"error": f"Failed to search code: {str(e)}"}
 
 
 def stitch_infrastructure(code_finder: CodeFinder, **args) -> Dict[str, Any]:

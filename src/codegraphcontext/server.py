@@ -365,6 +365,9 @@ class MCPServer:
     def find_code_tool(self, **args) -> Dict[str, Any]:
         return analysis_handlers.find_code(self.code_finder, **args)
 
+    def search_code_tool(self, **args) -> Dict[str, Any]:
+        return analysis_handlers.search_code(self.code_finder, **args)
+
     def list_indexed_repositories_tool(self, **args) -> Dict[str, Any]:
         return management_handlers.list_indexed_repositories(self.code_finder, **args)
 
@@ -741,6 +744,7 @@ class MCPServer:
             "add_package_to_graph": self.add_package_to_graph_tool,
             "find_dead_code": self.find_dead_code_tool,
             "find_code": self.find_code_tool,
+            "search_code": self.search_code_tool,
             "analyze_code_relationships": self.analyze_code_relationships_tool,
             "analyze_impact": self.analyze_impact_tool,
             "stitch_infrastructure": self.stitch_infrastructure_tool,

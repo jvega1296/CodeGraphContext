@@ -595,6 +595,30 @@ TOOLS = {
             }
         }
     },
+    "search_code": {
+        "name": "search_code",
+        "description": "Search for code via a 3-tier cascade: exact Cypher name/content match, then SQLite FTS5 lexical search, then semantic embedding search. Returns results from the first tier that finds anything, with 'tier_used' indicating which one fired. Use this instead of 'find_code' when an exact/fuzzy name match may not exist and a broader natural-language-style search is wanted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keyword, phrase, or natural-language description of the code to search for"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Optional: Maximum number of results to return (default: 20).",
+                    "default": 20
+                },
+                "repo_path": {
+                    "type": "string",
+                    "description": "Optional: Path to the repository to restrict the exact-match tier to."
+                }
+            },
+            "required": ["query"]
+        }
+    },
+
     "analyze_change_risk": {
         "name": "analyze_change_risk",
         "description": "Analyze a diff-level change set (e.g. a pull request) and produce a priority-ordered risk report: a per-function risk score, test-coverage gaps, and the top 10 functions/classes to review first.",

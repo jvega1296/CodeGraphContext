@@ -14,6 +14,7 @@ from codegraphcontext.tools.risk_scoring import (
     community_crossing_score,
     compute_file_churn_with_status,
     find_test_coverage_count,
+    qualified_name_proxy,
     security_sensitivity_score,
 )
 # `test_coverage_score` is imported locally inside the tests that use it
@@ -57,6 +58,34 @@ def test_community_crossing_score_counts_cross_module_callers_capped_at_point_fi
     ]
     # 4 crossings * 0.05 = 0.20, capped at 0.15
     assert community_crossing_score(target_path, caller_paths) == 0.15
+
+
+def test_qualified_name_proxy_strips_source_root_and_extension():
+    assert qualified_name_proxy(
+        "src/main/java/com/az/oms/order/OrderValidator.java"
+    ) == "com.az.oms.order.OrderValidator"
+
+
+def test_qualified_name_proxy_falls_back_to_bare_filename_without_a_source_root():
+    assert qualified_name_proxy("src/auth.py") == "auth"
+
+
+def test_qualified_name_proxy_excludes_repo_name_noise_from_security_sensitivity():
+    # The repo-name/outer-directory segment ("query-service-repo") contains a
+    # SECURITY_KEYWORDS word ("query") that has nothing to do with the
+    # function actually being scored -- the raw path alone would trigger a
+    # false-positive match; the proxy must not leak that segment in.
+    path = "query-service-repo/src/main/java/com/az/billing/InvoiceGenerator.java"
+    proxy = qualified_name_proxy(path)
+    assert proxy == "com.az.billing.InvoiceGenerator"
+    assert "query" not in proxy.lower()
+    assert security_sensitivity_score("generateInvoice", proxy) == 0.0
+
+    # Sanity check the other direction: a keyword that is actually part of
+    # the package/class identity (not just the unrelated repo-name prefix)
+    # must still be detected through the same proxy.
+    sibling_path = "query-service-repo/src/main/java/com/az/billing/query/QueryBuilder.java"
+    assert security_sensitivity_score("generateInvoice", qualified_name_proxy(sibling_path)) == 0.20
 
 
 def _init_git_repo(repo_path) -> None:

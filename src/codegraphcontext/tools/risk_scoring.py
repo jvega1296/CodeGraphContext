@@ -40,17 +40,22 @@ def caller_count_score(caller_count: int) -> float:
     return min(caller_count / 20.0, 0.10)
 
 
-def _top_level_module_segment(path: str) -> str:
-    """Return the comparison key used to decide whether two paths cross a module boundary.
+def _strip_source_root(path: str) -> Optional[List[str]]:
+    """Return the path segments after a ``DEFAULT_JAVA_SOURCE_DIRS`` marker,
+    filename included, or ``None`` when no marker matches with a non-empty
+    directory remainder.
 
-    Per the Java source-root convention (``DEFAULT_JAVA_SOURCE_DIRS``), strip the
-    language-root marker (``src/main/java`` or ``src/main/kotlin``) and the filename,
-    then use the last remaining directory segment -- i.e. the directory that directly
-    contains the file. This is the file's feature-module directory (e.g. "order",
-    "shipping", "payment") and is what actually distinguishes same-module callers from
-    cross-module callers for Java packages that share a common org-wide prefix such as
-    "com/az/oms". The third ("." ) entry in DEFAULT_JAVA_SOURCE_DIRS is a last-resort
-    marker, not a literal path-splitting substring, so it is skipped here.
+    Shared by :func:`_top_level_module_segment` (keeps only the last
+    directory segment) and :func:`qualified_name_proxy` (keeps every
+    segment, filename included, as a package-like proxy). Matches markers
+    exactly as the original single-use version of this loop did: it keeps
+    searching later marker positions/markers rather than stopping at the
+    first match whose directory remainder (the segments between the marker
+    and the filename) is empty, so a marker match that sits directly above
+    the file with no package directories in between does not shadow a real
+    match found elsewhere in the path. The third ("." ) entry in
+    DEFAULT_JAVA_SOURCE_DIRS is a last-resort marker, not a literal
+    path-splitting substring, so it is skipped here.
     """
     posix_path = path.replace("\\", "/")
     parts = [part for part in posix_path.split("/") if part]
@@ -62,13 +67,66 @@ def _top_level_module_segment(path: str) -> str:
         window = len(marker_parts)
         for i in range(len(parts) - window + 1):
             if parts[i:i + window] == marker_parts:
-                remainder = parts[i + window:-1]
-                if remainder:
-                    return remainder[-1]
+                remainder = parts[i + window:]
+                if remainder[:-1]:
+                    return remainder
+    return None
 
+
+def _top_level_module_segment(path: str) -> str:
+    """Return the comparison key used to decide whether two paths cross a module boundary.
+
+    Per the Java source-root convention (``DEFAULT_JAVA_SOURCE_DIRS``), strip the
+    language-root marker (``src/main/java`` or ``src/main/kotlin``) and the filename,
+    then use the last remaining directory segment -- i.e. the directory that directly
+    contains the file. This is the file's feature-module directory (e.g. "order",
+    "shipping", "payment") and is what actually distinguishes same-module callers from
+    cross-module callers for Java packages that share a common org-wide prefix such as
+    "com/az/oms".
+    """
+    remainder = _strip_source_root(path)
+    if remainder:
+        return remainder[:-1][-1]
+
+    posix_path = path.replace("\\", "/")
+    parts = [part for part in posix_path.split("/") if part]
     if len(parts) >= 2:
         return parts[-2]
     return posix_path
+
+
+def qualified_name_proxy(path: str) -> str:
+    """Package-relative proxy for a qualified name, for callers (Task 16's
+    ``analyze_impact``) that only have a raw file path and no real
+    ``qualified_name`` field to pass to :func:`security_sensitivity_score`.
+
+    Keeps only the segments after a ``DEFAULT_JAVA_SOURCE_DIRS`` marker
+    (the package-equivalent directories) plus the file's basename (extension
+    stripped), joined with ``"."`` -- e.g.
+    ``"src/main/java/com/az/oms/order/OrderValidator.java"`` becomes
+    ``"com.az.oms.order.OrderValidator"``. This deliberately drops the
+    repo-name and any outer directory segments above the source root: those
+    are noise an unrelated hyphenated service name (e.g. "oms-order-consumer")
+    could coincidentally share a ``SECURITY_KEYWORDS`` word with (``session``,
+    ``request``, ``query``, ...), producing a false-positive security match
+    that has nothing to do with the function actually being scored.
+
+    Falls back to the bare filename (extension stripped) when no source-root
+    marker matches -- still excludes the unrelated outer path segments, even
+    though there is no package-qualification signal left to include.
+    """
+    remainder = _strip_source_root(path)
+    if remainder is None:
+        posix_path = path.replace("\\", "/")
+        parts = [part for part in posix_path.split("/") if part]
+        remainder = parts[-1:]
+
+    if not remainder:
+        return ""
+
+    *package_parts, filename = remainder
+    basename = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return ".".join([*package_parts, basename])
 
 
 def community_crossing_score(target_path: str, caller_paths: List[str]) -> float:

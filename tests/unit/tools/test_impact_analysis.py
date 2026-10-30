@@ -100,6 +100,22 @@ class _FakeSession:
         elif "MATCH (target)-[r:CALLS" in query:
             return _FakeResult([{"count": 3}])
 
+        elif "RETURN c.path as path" in query:
+            # Caller file paths for the ported community-crossing risk
+            # factor (Task 16's _caller_paths_query). Only createOrder's
+            # target_uid gets a deliberately mixed same-module/cross-module
+            # caller set -- AuthService/validateOrder's flat "src/<file>.py"
+            # paths would all resolve to the same top-level segment either
+            # way, which would never prove this query's wiring (direction,
+            # alias, source/target) is actually correct rather than just
+            # absent.
+            if "func_create_order" in kwargs.get("target_uids", []):
+                return _FakeResult([
+                    {"path": "src/orders.py"},           # same top-level dir as target -- non-crossing
+                    {"path": "src/billing/invoice.py"},  # different top-level dir -- crossing
+                ])
+            return _FakeResult([])
+
         elif "NOT (t)<-[:CONSUMES_FROM]-()" in query:
             # Query D (dead-end detection): only the inventory-audit frontier
             # reaches a topic with no indexed consumer at all.
@@ -308,6 +324,19 @@ def test_analyze_impact_degrades_gracefully_when_repo_has_no_git_history(tmp_pat
     res = finder.analyze_impact(target="AuthService", repo_path=str(tmp_path))
     assert res["churn_status"] == "unavailable"
     assert res["risk_score"] >= 0.0  # call still succeeds and returns a usable score, just without the churn term
+
+def test_analyze_impact_community_crossing_factor_reflects_caller_paths_query():
+    """Proves _caller_paths_query's actual wiring (direction, alias,
+    source/target), not just its presence -- the other risk-score tests all
+    target AuthService/validateOrder, whose flat "src/<file>.py" paths
+    resolve to the same top-level segment regardless of a direction/alias
+    bug in the query, so they would pass identically even if the query were
+    wrong. createOrder's fixture caller paths are a deliberately mixed
+    same-module/cross-module set instead."""
+    finder, recorder = _make_finder()
+    res = finder.analyze_impact(target="createOrder")
+    assert res["risk_factors"]["community_crossing"] > 0.0
+    assert res["risk_factors"]["community_crossing"] == pytest.approx(0.05)
 
 def test_analyze_impact_both_includes_ported_risk_score_in_merged_block(tmp_path):
     """direction="both" is handled by a separate return block

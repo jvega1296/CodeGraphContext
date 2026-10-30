@@ -2344,9 +2344,12 @@ class CodeFinder:
         name = primary.get("name") or ""
         target_path = primary.get("path") or ""
         # target_nodes (see _resolve_impact_target) carries no qualified_name
-        # -- the file path is the closest available proxy and still carries
-        # useful signal (e.g. "src/auth/..." matches the "auth" keyword).
-        qualified_name = target_path
+        # -- qualified_name_proxy strips the repo-name/outer-directory noise
+        # from the raw path (a hyphenated service directory can coincidentally
+        # contain a SECURITY_KEYWORDS word unrelated to the function itself),
+        # keeping only the package-equivalent segments and the class/file
+        # basename as the closest available proxy.
+        qualified_name = risk_scoring.qualified_name_proxy(target_path)
 
         target_uids = [n["uid"] for n in target_nodes]
         with self.driver.session() as session:

@@ -48,6 +48,52 @@ def test_scan_repo_joins_bean_and_activator_across_two_files(tmp_path):
     assert sub.fqn.endswith("ListenerService.onOrderCreateEvent")
 
 
+def test_caller_with_a_file_over_the_extraction_size_cap_still_resolves_pending_publisher(tmp_path):
+    """A caller file too large for full per-file extraction (max_file_kb)
+    must still be readable for the much cheaper caller-argument-resolution
+    text scan -- confirmed real against special-order-services's actual
+    587 KB OrderServiceImpl.java, which is exactly where a Pub/Sub wrapper
+    method's real @Value-injected topic argument lives."""
+    _write(tmp_path / "src/main/java/PublishMessagePubSub.java", """
+    public class PublishMessagePubSub {
+        private final PubSubTemplate pubSubTemplate;
+        public void publishToOMSTopic(final String topic, final String orderId) {
+            pubSubTemplate.publish(topic, orderId);
+        }
+    }
+    """)
+    # Padded well past a tiny max_file_kb cap with an inert comment block,
+    # so the file is unambiguously over the extraction-cost cap while still
+    # containing the one real call site that matters.
+    padding = "// filler\n" * 20000
+    caller_source = (
+        padding
+        + """
+    public class OrderServiceImpl {
+        @Value("${topic.order.oms}")
+        private String omsTopic;
+        private final PublishMessagePubSub publishMessage;
+        public void createOrder() {
+            publishMessage.publishToOMSTopic(omsTopic, "order-1");
+        }
+    }
+    """
+    )
+    _write(tmp_path / "src/main/java/OrderServiceImpl.java", caller_source)
+    _write(
+        tmp_path / "src/main/resources/application.yml",
+        "topic:\n  order:\n    oms: oms-order-create-event\n",
+    )
+    assert len(caller_source.encode("utf-8")) > 100 * 1024  # comfortably over a 100 KB cap
+
+    result = scan_repo_pubsub(tmp_path, store=scan_repo_config(tmp_path), max_file_kb=100)
+    assert any("OrderServiceImpl.java" in w and "KB cap" in w for w in result.warnings)
+    assert len(result.publishers) == 1
+    rec = result.publishers[0]
+    assert rec.topic_resolved == "oms-order-create-event"
+    assert rec.pending_caller_method is None
+
+
 def test_unmatched_channel_adapter_bean_emits_warning(tmp_path):
     _write(tmp_path / "src/main/java/ListenerConfig.java", """
     @Configuration

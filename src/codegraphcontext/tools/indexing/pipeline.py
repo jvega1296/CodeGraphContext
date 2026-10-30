@@ -514,6 +514,8 @@ async def run_tree_sitter_index_async(
                 scan_repo_pubsub,
                 write_wire_edges,
             )
+            from ...wire.config_values import BASE_PROFILE, ConfigValue
+            from ...wire.external_env_config import discover_external_env_config
             repo_root = path.resolve()
             include_ambiguous = (_gcv("MULTI_REPO_LINKS_INCLUDE_AMBIGUOUS") or "false").lower() == "true"
             warning_logger(
@@ -521,10 +523,35 @@ async def run_tree_sitter_index_async(
                 f"(include_ambiguous={include_ambiguous})"
             )
             store = scan_repo_config(repo_root)
-            kafka_scan = scan_repo_kafka(repo_root, store=store)
-            http_scan = scan_repo_http(repo_root, store=store)
-            grpc_scan = scan_repo_grpc(repo_root, store=store)
-            pubsub_scan = scan_repo_pubsub(repo_root, store=store)
+
+            # A @Value placeholder resolved from the repo's own
+            # application*.yml can itself be ANOTHER placeholder pointing at
+            # a bare OS environment variable with no literal anywhere in
+            # this repo at all (common for Cloud Run/Kubernetes-deployed
+            # services, which externalize env vars to a separate deploy
+            # manifest -- sometimes a sibling "ops config" repo, sometimes a
+            # directory inside this same repo). Best-effort, additive only:
+            # a repo with nothing externalized gets an empty result and
+            # behaves exactly as before.
+            external_env = discover_external_env_config(repo_root)
+            for key, value in external_env.env_vars.items():
+                store.add(ConfigValue(
+                    repo_root=str(repo_root), key=key, value=value,
+                    source_file=external_env.source_files[0] if external_env.source_files else str(repo_root),
+                    source_kind="external-env", profile=BASE_PROFILE,
+                ))
+            active_profile = external_env.active_profile or BASE_PROFILE
+            if external_env.env_vars:
+                warning_logger(
+                    f"[WIRE] Externalized env config discovered: "
+                    f"{len(external_env.env_vars)} vars from {len(external_env.source_files)} "
+                    f"file(s), active_profile={active_profile!r}"
+                )
+
+            kafka_scan = scan_repo_kafka(repo_root, store=store, active_profile=active_profile)
+            http_scan = scan_repo_http(repo_root, store=store, active_profile=active_profile)
+            grpc_scan = scan_repo_grpc(repo_root, store=store, active_profile=active_profile)
+            pubsub_scan = scan_repo_pubsub(repo_root, store=store, active_profile=active_profile)
             warning_logger(
                 f"[WIRE] Scan complete — "
                 f"kafka p/c={len(kafka_scan.producers)}/{len(kafka_scan.consumers)} "

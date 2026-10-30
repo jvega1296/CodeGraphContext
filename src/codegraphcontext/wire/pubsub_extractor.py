@@ -37,9 +37,9 @@ Confidence tiers (mirrors :mod:`schema_contract.WIRE_CONFIDENCE_TIERS`):
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from codegraphcontext.wire.config_values import (
     BASE_PROFILE,
@@ -59,6 +59,22 @@ class PubsubPublisherRecord:
     source_file: str
     line: int               # 1-based
     call_shape: str         # "PubSubTemplate.publish"
+    # Set only when the topic argument is a bare parameter of the enclosing
+    # (often abstract/wrapper) method, and so cannot be determined from this
+    # file alone -- the real literal is supplied by whoever calls this
+    # method, commonly from a different class entirely (an abstract
+    # `MessagePublisher.publishX(String topic, ...)` wrapper whose callers
+    # pass an @Value-injected field). `pending_caller_method` is the
+    # enclosing method's simple name (used to find real call sites
+    # repo-wide); `pending_caller_param_index` is the 0-based position of
+    # this parameter in that method's declared signature. See
+    # `resolve_pending_publishers_via_callers` for the resolution pass that
+    # consumes these. `confidence` is always "AMBIGUOUS" for a pending
+    # record (so it is dropped by default if resolution never happens) --
+    # never the bare-parameter-name-as-topic "SYMBOLIC" value real callers
+    # would otherwise get written to the graph as.
+    pending_caller_method: Optional[str] = None
+    pending_caller_param_index: Optional[int] = None
 
 
 @dataclass
@@ -546,6 +562,37 @@ def _find_set_output_channel(
     return _read_first_call_arg(source, m.end() - 1)
 
 
+def _param_index_in_method(method_decl: "_MethodDecl", identifier: str) -> Optional[int]:
+    """Return the 0-based position of ``identifier`` among ``method_decl``'s
+    declared parameters, or ``None`` if it is not one of them (a local
+    variable, an unrelated field, ...)."""
+    for i, part in enumerate(_split_top_level_args(method_decl.params_text)):
+        m_name = re.search(r"([A-Za-z_]\w*)\s*$", part)
+        if m_name and m_name.group(1) == identifier:
+            return i
+    return None
+
+
+def _enclosing_method_decl(
+    method_decls: Sequence["_MethodDecl"], offset: int
+) -> Optional["_MethodDecl"]:
+    """Return the method declaration whose body contains ``offset``.
+
+    Abstract/interface declarations (``body_start is None``) never match —
+    there is no call site inside a method with no body. When bodies are
+    nested (a local/anonymous class's method inside an outer one), the
+    innermost (smallest body span) match wins.
+    """
+    best: Optional["_MethodDecl"] = None
+    for decl in method_decls:
+        if decl.body_start is None or decl.body_end is None:
+            continue
+        if decl.body_start < offset < decl.body_end:
+            if best is None or (decl.body_end - decl.body_start) < (best.body_end - best.body_start):
+                best = decl
+    return best
+
+
 def _qualifier_for_param(params_text: str, param_name: str) -> Optional[str]:
     """Return the raw ``@Qualifier(...)`` text (verbatim, quotes kept) for
     the parameter named ``param_name``, or ``None`` if that parameter has
@@ -651,8 +698,17 @@ def _classify_arg(
     store: Optional[ConfigValueStore],
     active_profile: str,
     string_consts: dict,
+    value_fields: Optional[dict] = None,
 ) -> Tuple[str, str, str, str]:
-    """Turn a first-argument expression into ``(topic_raw, topic_resolved, confidence, provenance)``."""
+    """Turn a first-argument expression into ``(topic_raw, topic_resolved, confidence, provenance)``.
+
+    ``value_fields`` (an optional ``{IDENTIFIER: placeholder}`` map of
+    ``@Value("${...}")``-annotated fields, mirroring what
+    ``_classify_subscription`` already checks on the consumer side) is
+    consulted after ``string_consts`` so a plain ``String X = "lit";``
+    constant and an ``@Value`` field are both resolvable the same way,
+    whichever class the identifier being classified actually belongs to.
+    """
     text = arg_text.strip()
 
     m = _STRING_LITERAL_RE.match(text)
@@ -667,6 +723,12 @@ def _classify_arg(
                 const, store, active_profile
             )
             return resolved_raw, resolved_val, tier, f"identifier:{text}→{prov}"
+        placeholder = (value_fields or {}).get(text)
+        if placeholder is not None:
+            resolved_raw, resolved_val, tier, prov = _classify_literal(
+                placeholder, store, active_profile
+            )
+            return resolved_raw, resolved_val, tier, f"identifier:{text}→{prov}"
         # No in-class literal traces this identifier to a value — the
         # extractor cannot invent one, so it is reported as an unresolved
         # symbolic reference rather than dropped.
@@ -677,6 +739,21 @@ def _classify_arg(
     return text, text, "AMBIGUOUS", "expression"
 
 
+# A fully-qualified GCP Pub/Sub resource name (`projects/<id>/topics/<name>`
+# or `projects/<id>/subscriptions/<name>`) -- the shape real Cloud Run env
+# vars carry (see e.g. PUB_SUB_SUBSCRIPTION_NAME), as opposed to the bare
+# name Terraform's `pull_subscriptions`/topic blocks declare. Without this
+# normalization a fully-resolved env-var value could never match its
+# Terraform-side Topic/Subscription node by name even though both sides
+# plainly refer to the same real resource.
+_GCP_RESOURCE_PATH_RE = re.compile(r"^projects/[^/]+/(?:topics|subscriptions)/(.+)$")
+
+
+def _normalize_gcp_resource_name(value: str) -> str:
+    m = _GCP_RESOURCE_PATH_RE.match(value)
+    return m.group(1) if m else value
+
+
 def _classify_literal(
     raw: str,
     store: Optional[ConfigValueStore],
@@ -684,7 +761,7 @@ def _classify_literal(
 ) -> Tuple[str, str, str, str]:
     """Classify a string-literal value (already unquoted)."""
     if "${" not in raw:
-        return raw, raw, "EXTRACTED", "literal"
+        return raw, _normalize_gcp_resource_name(raw), "EXTRACTED", "literal"
     if store is None:
         return raw, raw, "SYMBOLIC", "unresolved:no-store"
     resolution: PlaceholderResolution = store.resolve_placeholders(raw, active_profile)
@@ -694,7 +771,7 @@ def _classify_literal(
             prov = f"config:{first_key}({source_label})"
         else:
             prov = "config:defaults"
-        return raw, resolution.output, "INFERRED", prov
+        return raw, _normalize_gcp_resource_name(resolution.output), "INFERRED", prov
     first_unresolved = resolution.unresolved[0] if resolution.unresolved else "?"
     return raw, resolution.output, "SYMBOLIC", f"unresolved:{first_unresolved}"
 
@@ -722,7 +799,7 @@ def extract_publishers_from_source(
     one that did but used an unrecognized call shape.
     """
     result = PubsubExtractionResult()
-    path_str = str(path)
+    path_str = Path(path).as_posix()
 
     pkg = _extract_package(source)
     spans = _extract_class_spans(source)
@@ -732,6 +809,8 @@ def extract_publishers_from_source(
 
     class_consts_cache: dict = {}
     class_pubsub_fields_cache: dict = {}
+    class_value_fields_cache: dict = {}
+    method_decls = _iter_method_declarations(source)
 
     def _fqn(span: _ClassSpan, method: str) -> str:
         prefix = f"{pkg}." if pkg else ""
@@ -755,7 +834,48 @@ def extract_publishers_from_source(
         consts = class_consts_cache.setdefault(
             id(span), _string_constants_in_class(source, span)
         )
-        raw, resolved, tier, prov = _classify_arg(arg, store, active_profile, consts)
+        value_fields = class_value_fields_cache.setdefault(
+            id(span), _value_fields_in_class(source, span)
+        )
+
+        # A bare identifier that is neither a class constant nor an @Value
+        # field but IS one of the enclosing method's own parameters cannot
+        # be resolved from this file alone -- the real value is supplied by
+        # whoever calls this (often abstract/wrapper) method, commonly from
+        # a different class. Defer to the repo-wide caller-argument-tracing
+        # pass (resolve_pending_publishers_via_callers) instead of letting
+        # _classify_arg's generic "unresolved identifier" fallback write the
+        # bare parameter NAME into the graph as if it were a real topic.
+        pending_method: Optional[str] = None
+        pending_index: Optional[int] = None
+        if (
+            re.fullmatch(r"[A-Za-z_]\w*", arg)
+            and arg not in consts
+            and arg not in value_fields
+        ):
+            decl = _enclosing_method_decl(method_decls, m.start())
+            if decl is not None:
+                idx = _param_index_in_method(decl, arg)
+                if idx is not None:
+                    pending_method = method_name
+                    pending_index = idx
+
+        if pending_method is not None:
+            result.publishers.append(PubsubPublisherRecord(
+                fqn=_fqn(span, method_name),
+                topic_raw=arg,
+                topic_resolved=arg,
+                confidence="AMBIGUOUS",
+                provenance=f"unresolved:param:{arg}",
+                source_file=path_str,
+                line=_offset_to_line(source, m.start()),
+                call_shape="PubSubTemplate.publish",
+                pending_caller_method=pending_method,
+                pending_caller_param_index=pending_index,
+            ))
+            continue
+
+        raw, resolved, tier, prov = _classify_arg(arg, store, active_profile, consts, value_fields)
         result.publishers.append(PubsubPublisherRecord(
             fqn=_fqn(span, method_name),
             topic_raw=raw,
@@ -795,7 +915,7 @@ def extract_channel_adapter_beans_from_source(
     """
     beans: List[PubsubChannelAdapterBean] = []
     warnings: List[str] = []
-    path_str = str(path)
+    path_str = Path(path).as_posix()
 
     pkg = _extract_package(source)
     spans = _extract_class_spans(source)
@@ -874,7 +994,7 @@ def extract_service_activators_from_source(
     """
     activators: List[PubsubServiceActivator] = []
     warnings: List[str] = []
-    path_str = str(path)
+    path_str = Path(path).as_posix()
 
     pkg = _extract_package(source)
     spans = _extract_class_spans(source)
@@ -914,6 +1034,119 @@ def extract_service_activators_from_source(
     return activators, warnings
 
 
+# ── Cross-method caller-argument resolution ─────────────────────────────────
+
+# `<recv>.<method>(` for one specific, already-known method simple name --
+# mirrors _PUBLISH_CALL_RE's receiver-agnostic shape (any identifier
+# receiver) but anchored to the exact method being resolved, since the
+# wrapper method being searched for is generally called through a field
+# injected under a DIFFERENT name in each calling class (there is no single
+# conventional receiver name the way `pubSubTemplate` is for PubSubTemplate
+# itself).
+def _call_site_re(method_name: str) -> "re.Pattern":
+    return re.compile(r"(?<![\w.])[A-Za-z_]\w*\s*\.\s*" + re.escape(method_name) + r"\s*\(")
+
+
+def resolve_pending_publishers_via_callers(
+    publishers: List[PubsubPublisherRecord],
+    file_texts: Dict[str, str],
+    *,
+    store: Optional[ConfigValueStore] = None,
+    active_profile: str = BASE_PROFILE,
+) -> Tuple[List[PubsubPublisherRecord], List[str]]:
+    """Resolve publisher records whose topic argument is a bare parameter of
+    the enclosing (often abstract/wrapper) method -- see
+    ``PubsubPublisherRecord.pending_caller_method`` -- by finding every real
+    call site of that method across every file in ``file_texts`` and
+    classifying the argument actually passed there, using the CALLING file's
+    own class context (string constants / @Value fields), exactly as if that
+    argument had appeared directly at a normal single-file publish call.
+
+    A wrapper method commonly fans out to several genuinely distinct real
+    topics across different call sites (the same generic
+    ``publishX(topic, payload)`` method used by many different callers, each
+    injecting its own ``@Value``-configured topic) -- this returns one
+    resolved record per distinct resolved topic, not a single merged one,
+    since each caller really does produce its own ``PRODUCES_TO`` edge from
+    the same Function node to a different Topic node.
+
+    A pending record with no resolvable caller anywhere is dropped entirely
+    (not returned) and reported as a warning instead -- there is nothing
+    further this module can infer, and keeping the original AMBIGUOUS record
+    (naming a bare parameter, not a topic) would otherwise risk a future
+    caller mistaking it for a real, if low-confidence, topic match.
+
+    Non-pending records pass through unchanged.
+    """
+    resolved: List[PubsubPublisherRecord] = []
+    warnings: List[str] = []
+
+    class_spans_cache: Dict[str, List[_ClassSpan]] = {}
+
+    def _spans_for(path: str) -> List[_ClassSpan]:
+        if path not in class_spans_cache:
+            class_spans_cache[path] = _extract_class_spans(file_texts[path])
+        return class_spans_cache[path]
+
+    for rec in publishers:
+        if rec.pending_caller_method is None:
+            resolved.append(rec)
+            continue
+
+        method_name = rec.pending_caller_method
+        param_index = rec.pending_caller_param_index
+        call_re = _call_site_re(method_name)
+        seen_topics: set = set()
+        any_resolved = False
+
+        for caller_path, caller_source in file_texts.items():
+            caller_spans = _spans_for(caller_path)
+            if not caller_spans:
+                continue
+            for cm in call_re.finditer(caller_source):
+                open_paren = cm.end() - 1
+                close_paren = _find_matching_paren(caller_source, open_paren)
+                if close_paren == -1:
+                    continue
+                args = _split_top_level_args(caller_source[open_paren + 1:close_paren])
+                if param_index is None or param_index >= len(args):
+                    continue
+                arg_text = args[param_index].strip()
+                caller_span = _enclosing_class(caller_spans, cm.start())
+                if caller_span is None:
+                    continue
+                caller_consts = _string_constants_in_class(caller_source, caller_span)
+                caller_value_fields = _value_fields_in_class(caller_source, caller_span)
+                c_raw, c_resolved, c_tier, c_prov = _classify_arg(
+                    arg_text, store, active_profile, caller_consts, caller_value_fields,
+                )
+                if c_tier not in ("EXTRACTED", "INFERRED"):
+                    continue
+                any_resolved = True
+                if c_resolved in seen_topics:
+                    continue
+                seen_topics.add(c_resolved)
+                resolved.append(replace(
+                    rec,
+                    topic_raw=c_raw,
+                    topic_resolved=c_resolved,
+                    confidence=c_tier,
+                    provenance=f"caller:{method_name}#{param_index}→{c_prov}",
+                    pending_caller_method=None,
+                    pending_caller_param_index=None,
+                ))
+
+        if not any_resolved:
+            warnings.append(
+                f"{rec.source_file}: {rec.fqn} publishes via parameter "
+                f"{rec.topic_raw!r} (method {method_name!r}), but no caller "
+                "anywhere in the scanned repo supplied a resolvable topic "
+                "literal for it; this publish call site is not traced to any Topic"
+            )
+
+    return resolved, warnings
+
+
 __all__ = [
     "PubsubChannelAdapterBean",
     "PubsubExtractionResult",
@@ -923,4 +1156,5 @@ __all__ = [
     "extract_publishers_from_source",
     "extract_service_activators_from_source",
     "looks_like_pubsub_source",
+    "resolve_pending_publishers_via_callers",
 ]

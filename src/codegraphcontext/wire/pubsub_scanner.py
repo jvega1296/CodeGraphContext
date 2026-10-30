@@ -36,6 +36,7 @@ from codegraphcontext.wire.pubsub_extractor import (
     extract_channel_adapter_beans_from_source,
     extract_publishers_from_source,
     extract_service_activators_from_source,
+    resolve_pending_publishers_via_callers,
 )
 
 
@@ -66,6 +67,7 @@ def scan_repo_pubsub(
     include_dirs: Sequence[str] = DEFAULT_JAVA_SOURCE_DIRS,
     exclude_path_parts: Sequence[str] = DEFAULT_JAVA_EXCLUDE_PATH_PARTS,
     max_file_kb: int = 512,
+    caller_resolution_max_file_kb: int = 5120,
 ) -> PubsubScanResult:
     """Walk ``repo_root`` and extract GCP Pub/Sub publisher/subscriber records.
 
@@ -74,15 +76,36 @@ def scan_repo_pubsub(
     collecting channel-adapter beans and service activators repo-wide so
     they can be joined after the walk, regardless of which file each side
     came from.
+
+    ``caller_resolution_max_file_kb`` (default 5 MiB, much larger than
+    ``max_file_kb``'s 512 KiB) bounds a SEPARATE read used only to populate
+    the caller-argument-tracing cache (``resolve_pending_publishers_via_callers``),
+    not full extraction. A file over ``max_file_kb`` is still skipped for the
+    (comparatively expensive) per-file extraction passes, but real services
+    legitimately have one or two single-class "God objects" well past 512 KB
+    (confirmed real: a 587 KB OrderServiceImpl.java is exactly where the
+    caller of an abstract Pub/Sub wrapper method's real @Value-injected topic
+    argument lives) -- excluding such a file from the caller-resolution text
+    cache entirely silently defeats cross-method resolution for every
+    wrapper method it happens to call into, with no diagnostic signal beyond
+    the generic "no caller anywhere" warning. Reading a few extra megabytes
+    of text once per repo scan is cheap; re-running full extraction on it is
+    not, which is why the two caps stay independent.
     """
     root = Path(repo_root).resolve()
     result = PubsubScanResult()
 
     seen: set = set()
     max_bytes = max_file_kb * 1024
+    caller_resolution_max_bytes = caller_resolution_max_file_kb * 1024
 
     beans: List[PubsubChannelAdapterBean] = []
     activators: List[PubsubServiceActivator] = []
+    # Retained so pending publisher records (a wrapper method's topic
+    # argument is a bare parameter, real value supplied by a caller
+    # elsewhere in the repo -- see extract_publishers_from_source) can be
+    # resolved against every other scanned file's text after the walk.
+    file_texts: Dict[str, str] = {}
 
     for rel in include_dirs:
         base = (root / rel).resolve()
@@ -106,6 +129,14 @@ def scan_repo_pubsub(
                 result.warnings.append(
                     f"{path}: skipped ({size / 1024:.1f} KB > {max_file_kb} KB cap)"
                 )
+                # Still worth reading for caller-argument resolution (a
+                # cheap text scan, not full extraction) unless it is
+                # implausibly huge even for that.
+                if size <= caller_resolution_max_bytes:
+                    try:
+                        file_texts[str(path)] = path.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        pass
                 continue
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
@@ -115,6 +146,7 @@ def scan_repo_pubsub(
                 continue
 
             result.files_scanned += 1
+            file_texts[str(path)] = text
 
             pub_result = extract_publishers_from_source(
                 text, path, store=store, active_profile=active_profile,
@@ -182,6 +214,18 @@ def scan_repo_pubsub(
                 "no channel-adapter bean anywhere in the repo matches it; this "
                 "activator's consumer-side wiring is not joined to a Pub/Sub subscription"
             )
+
+    # Resolve any publisher whose topic argument is a bare parameter of an
+    # abstract/wrapper method (see extract_publishers_from_source) by
+    # searching every real call site of that method across the whole repo
+    # just scanned -- this is the repo-wide join this module already exists
+    # to perform for the consumer side (bean <-> activator), applied to the
+    # producer side's own cross-method case.
+    resolved_publishers, pending_warnings = resolve_pending_publishers_via_callers(
+        result.publishers, file_texts, store=store, active_profile=active_profile,
+    )
+    result.publishers = resolved_publishers
+    result.warnings.extend(pending_warnings)
 
     return result
 

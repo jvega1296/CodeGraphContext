@@ -527,7 +527,7 @@ def parse_node(node, nodes_dict):
         "label": display_name,
         "type": str(labels[0]).capitalize() if labels else "Other",
         "file": str(props.get('path', props.get('file', ''))),
-        "val": 4 if (labels and labels[0] in ['Repository', 'Class', 'Interface', 'Trait']) else 2,
+        "val": 4 if (labels and labels[0] in ['Repository', 'Class', 'Interface', 'Trait', 'Topic', 'Subscription', 'Endpoint']) else 2,
         "properties": props
     }
 

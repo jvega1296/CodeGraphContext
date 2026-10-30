@@ -95,10 +95,11 @@ const DEFAULT_NODE_COLORS: Record<string, string> = {
   Annotation: '#ec407a',
   Parameter: '#90a4ae',
   Other: '#78909c',
-  // Infrastructure / wire-coupling nodes — visually distinct from code-structure palette
-  Topic: '#e879f9',
-  Subscription: '#22d3ee',
-  Endpoint: '#bef264',
+  // Infrastructure / wire-coupling nodes — visually distinct from code-structure palette.
+  // -600 Tailwind shades: ≥3:1 contrast against both #f5f5f7 (light canvas) and #020202 (dark canvas).
+  Topic: '#c026d3',
+  Subscription: '#0891b2',
+  Endpoint: '#65a30d',
 };
 
 const DEFAULT_EDGE_COLORS: Record<string, string> = {
@@ -109,13 +110,18 @@ const DEFAULT_EDGE_COLORS: Record<string, string> = {
   IMPLEMENTS: '#26a69a',
   INCLUDES: '#81c784',
   HAS_PARAMETER: '#ffca28',
-  // Infrastructure / wire-coupling edges — bright family, reads as different category from code-structure edges
+  // Infrastructure / wire-coupling edges — reads as different category from code-structure edges.
+  // PRODUCES_TO/CONSUMES_FROM: warm orange vs cool cyan makes send/receive direction legible.
+  // SERVES: violet (not green — avoids clash with INHERITS/INCLUDES green band).
+  // INVOKES: hot pink (not orange — avoids clash with PRODUCES_TO orange).
+  // BACKED_BY: rose-red (infrastructure backing, distinct hue).
+  // HAS_SUBSCRIPTION: sky blue (not purple — avoids clash with CALLS purple).
   PRODUCES_TO: '#f97316',
   CONSUMES_FROM: '#06b6d4',
-  SERVES: '#84cc16',
-  INVOKES: '#fb923c',
+  SERVES: '#8b5cf6',
+  INVOKES: '#ec4899',
   BACKED_BY: '#f43f5e',
-  HAS_SUBSCRIPTION: '#a78bfa',
+  HAS_SUBSCRIPTION: '#0ea5e9',
 };
 
 // ─── Visualization Modes ─────────────────────────────────────────────────────

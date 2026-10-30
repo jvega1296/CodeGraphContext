@@ -119,3 +119,47 @@ def test_hcl_fixture_indexes_end_to_end_with_kuzu(tmp_path, sample_projects_path
         }
     finally:
         manager.close_driver()
+
+
+@pytest.mark.integration
+def test_hcl_pubsub_module_topic_attribute_lands_as_queryable_property(tmp_path):
+    """A module's `topic` attribute is a plain Terraform string, not a documentation field, but it
+    lands as a Class node property the same way `description` does, so a later Terraform-stitching
+    pass can match it against a `Topic` node by name without re-parsing HCL."""
+    if not get_tree_sitter_manager().is_language_available("hcl"):
+        pytest.skip("HCL tree-sitter grammar is not available")
+
+    repo = tmp_path / "pubsub_repo"
+    repo.mkdir()
+    (repo / "pubsub.tf").write_text(
+        """
+        module "oms_order_event_pubsub_config" {
+          source = "../../modules/pubsub"
+          topic  = "oms-order-create-event"
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    manager = _fresh_kuzu_manager(tmp_path / "kuzu-db")
+    try:
+        job_manager = JobManager()
+
+        async def index_fixture() -> str:
+            builder = GraphBuilder(manager, job_manager, asyncio.get_running_loop())
+            job_id = job_manager.create_job(str(repo), is_dependency=False)
+            await builder.build_graph_from_path_async(repo, job_id=job_id)
+            return job_id
+
+        job = job_manager.get_job(asyncio.run(index_fixture()))
+        assert job is not None
+        assert job.status == JobStatus.COMPLETED
+
+        with manager.get_driver().session() as session:
+            rows = session.run(
+                "MATCH (c:Class) WHERE c.topic = 'oms-order-create-event' RETURN c.name AS name"
+            ).data()
+            assert len(rows) == 1
+            assert rows[0]["name"] == "module.oms_order_event_pubsub_config"
+    finally:
+        manager.close_driver()

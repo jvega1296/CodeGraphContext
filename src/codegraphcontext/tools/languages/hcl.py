@@ -163,6 +163,7 @@ class HclTreeSitterParser:
             # Terraform's own description attribute is the block's documentation. Only a literal
             # one: an expression would store code where a reader expects prose.
             "docstring": self._literal(attributes.get("description")),
+            "topic": self._literal(attributes.get("topic")),
         }
         if self.index_source:
             node["source"] = self._text(block)

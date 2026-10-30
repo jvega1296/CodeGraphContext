@@ -211,3 +211,15 @@ class TestTfvars:
 def test_an_empty_file_yields_nothing(parser, tmp_path):
     result = parse(parser, tmp_path, "empty.tf", "")
     assert result["classes"] == result["variables"] == result["imports"] == []
+
+
+def test_module_block_with_topic_attribute_captures_it_as_a_property(parser, tmp_path):
+    source = """
+    module "oms_order_event_pubsub_config" {
+      source = "../../modules/pubsub"
+      topic  = "oms-order-create-event"
+    }
+    """
+    result = parse(parser, tmp_path, "pubsub.tf", source)
+    module_node = next(c for c in result["classes"] if c["name"].endswith("oms_order_event_pubsub_config"))
+    assert module_node["topic"] == "oms-order-create-event"

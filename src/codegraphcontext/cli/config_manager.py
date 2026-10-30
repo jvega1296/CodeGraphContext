@@ -146,6 +146,12 @@ DEFAULT_CONFIG = {
     # INVOKES/ALIAS_OF edges wiring services together across repositories.
     # Backwards-compatible on/off toggle for the lifetime of the feature.
     "MULTI_REPO_LINKS": "false",
+    # FTS5 lexical search sidecar: tier 2 of the search cascade (exact Cypher
+    # match, then this lexical fallback, then semantic embeddings). When
+    # "false" (default), no sidecar file is created and indexing is
+    # unaffected. When "true", a SQLite FTS5 index of every
+    # Function/Class/Variable node is rebuilt at the end of each index run.
+    "ENABLE_FTS5_INDEX": "false",
 }
 
 # Configuration key descriptions
@@ -252,6 +258,26 @@ CONFIG_DESCRIPTIONS = {
         "COST when true: one additional walk over parsed source per index run "
         "(typically <5% of CALLS resolution time)."
     ),
+    "ENABLE_FTS5_INDEX": (
+        "Enable a SQLite FTS5 lexical search sidecar -- the middle tier of "
+        "the search cascade (exact Cypher match, then this lexical "
+        "fallback, then semantic embeddings) -- indexing every "
+        "Function/Class/Variable node's name, qualified name, file path, "
+        "and docstring for fast ranked keyword lookup when an exact graph "
+        "match misses. "
+        "WHEN TO ENABLE: codebases where lookups need to tolerate typos, "
+        "partial identifiers, or natural-language keyword queries instead "
+        "of requiring an exact name match. "
+        "PREREQUISITES: none -- Python's stdlib sqlite3 must be compiled "
+        "with FTS5 support (true for the vast majority of distributions; "
+        "CGC probes this at index time and logs a warning rather than "
+        "failing if it is not available). "
+        "COST when false (default): zero -- no sidecar file is created or "
+        "touched. "
+        "COST when true: one additional full rebuild pass over every "
+        "Function/Class/Variable node at the end of each 'cgc index' run "
+        "(clear-and-reinsert, no incremental delta tracking yet)."
+    ),
 }
 
 # Valid values for each config key
@@ -275,6 +301,7 @@ CONFIG_VALIDATORS = {
     "FUZZY_SEARCH": ["true", "false"],
     "REDACT_SECRETS": ["true", "false"],
     "MULTI_REPO_LINKS": ["true", "false"],
+    "ENABLE_FTS5_INDEX": ["true", "false"],
 }
 
 SUPPORTED_DATABASES: List[str] = CONFIG_VALIDATORS["DEFAULT_DATABASE"]

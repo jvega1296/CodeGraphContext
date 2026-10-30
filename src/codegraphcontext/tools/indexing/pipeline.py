@@ -560,6 +560,43 @@ async def run_tree_sitter_index_async(
                 f"{traceback.format_exc()}"
             )
 
+    # -------------------------------------------------------------- Phase 7:
+    # ENABLE_FTS5_INDEX lexical search sidecar (search cascade tier 2).
+    # Rebuilds a SQLite FTS5 index of every Function/Class/Variable node's
+    # name/qualified_name/path/docstring for fast ranked keyword lookup when
+    # an exact Cypher match misses. Runs only when the flag is true.
+    # Failure never aborts the index.
+    if (_gcv("ENABLE_FTS5_INDEX") or "false").lower() == "true":
+        if job_id:
+            job_manager.update_job(job_id, status_message="Rebuilding FTS5 lexical search index...")
+        try:
+            import sqlite3
+
+            from ...cli.config_manager import resolve_context
+            from .search_fts5 import fts5_db_path, rebuild_fts5_index
+
+            resolved_context = resolve_context()
+            fts5_path = fts5_db_path(resolved_context)
+            fts5_path.parent.mkdir(parents=True, exist_ok=True)
+            warning_logger(f"[FTS5] Rebuilding lexical search index at {fts5_path}")
+
+            def _rebuild_fts5() -> int:
+                conn = sqlite3.connect(str(fts5_path))
+                try:
+                    with writer.driver.session() as session:
+                        return rebuild_fts5_index(conn, session)
+                finally:
+                    conn.close()
+
+            indexed_count = await asyncio.to_thread(_rebuild_fts5)
+            warning_logger(f"[FTS5] Rebuild complete — {indexed_count} nodes indexed")
+        except Exception as _fe:
+            import traceback
+            error_logger(
+                f"[FTS5] Lexical index rebuild failed (skipping): {_fe}\n"
+                f"{traceback.format_exc()}"
+            )
+
     if index_summary is not None:
         index_summary.clear()
         index_summary.update(

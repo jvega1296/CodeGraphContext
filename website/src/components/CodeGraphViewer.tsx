@@ -770,10 +770,11 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     setSimulationReady(false);
   }, [filteredData]);
 
-  // When focus is cleared, zoom out to show the full visible graph
+  // When focus is cleared, zoom out to show the full visible graph.
+  // Guard with simulationReady so this does not fire at mount (focusSet starts null).
   useEffect(() => {
-    if (focusSet === null) autoFitCamera();
-  }, [focusSet, autoFitCamera]);
+    if (focusSet === null && simulationReady) autoFitCamera();
+  }, [focusSet, simulationReady, autoFitCamera]);
 
   const nodeCanvasObject = useCallback((node: any, ctx: any, globalScale: number) => {
     if (!visibleNodeTypes.has(node.type)) return;
@@ -2849,7 +2850,8 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
             onNodeHover={setHoverNode}
             d3VelocityDecay={0.4}
             d3AlphaDecay={0.05}
-            // 3D simulation needs more ticks than 2D to settle (extra spatial dimension); 100 exceeds alpha-convergence threshold (~138 total with d3AlphaDecay=0.05)
+            // 3D simulation needs more ticks than 2D; warmupTicks=35 + cooldownTicks=100 = 135 total, meeting the ~135 convergence threshold (d3AlphaDecay=0.05)
+            warmupTicks={35}
             cooldownTicks={100}
             onEngineStop={() => { setSimulationReady(true); autoFitCamera(); }}
           />

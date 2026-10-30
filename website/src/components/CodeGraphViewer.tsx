@@ -1,5 +1,8 @@
 import ForceGraph2D from "react-force-graph-2d";
 import ForceGraph3D from "react-force-graph-3d";
+import Graph from 'graphology';
+import forceAtlas2 from 'graphology-layout-forceatlas2';
+import FA2LayoutSupervisor from 'graphology-layout-forceatlas2/worker';
 import CodeGraphChatPanel from "./CodeGraphChatPanel";
 import RepositorySummary from "./RepositorySummary";
 import * as THREE from "three";
@@ -124,6 +127,10 @@ const EMOJI_MAP: Record<string, string> = {
   Enum: '🔢', Annotation: '🏷️', Function: '⚙️',
   Macro: '🔧', Record: '📋', Union: '🔗', Property: '🏠',
 };
+
+// Above this node count, main-thread d3-force simulation causes visible jank on real cross-repo graphs;
+// pre-compute layout once via FA2 web worker so physics never runs on the render thread for large graphs.
+const LARGE_GRAPH_THRESHOLD = 400;
 
 // ─── City 3D Island Layout ───────────────────────────────────────────────────
 interface CityPlatform {
@@ -417,6 +424,8 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [focusSet, setFocusSet] = useState<{ nodes: Set<number>, links: Set<any> } | null>(null);
   const [simulationReady, setSimulationReady] = useState(false);
+  const fa2WorkerRef = useRef<InstanceType<typeof FA2LayoutSupervisor> | null>(null);
+  const [fa2Positions, setFa2Positions] = useState<Map<number, { x: number; y: number }> | null>(null);
 
   // Backend URL and repo_path from URL params (same pattern used by handleAIQuerySubmit)
   const backendParam = useMemo(() => new URLSearchParams(window.location.search).get("backend") || "", []);
@@ -768,7 +777,63 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
 
   useEffect(() => {
     setSimulationReady(false);
+    setFa2Positions(null); // clear stale positions whenever the visible graph changes
   }, [filteredData]);
+
+  // For large graphs, compute layout once in a FA2 web worker instead of running d3-force on the main thread.
+  useEffect(() => {
+    if (fa2WorkerRef.current) {
+      fa2WorkerRef.current.kill();
+      fa2WorkerRef.current = null;
+    }
+
+    if (filteredData.nodes.length < LARGE_GRAPH_THRESHOLD) return;
+
+    const graph = new Graph({ multi: false, allowSelfLoops: false });
+
+    for (const node of filteredData.nodes) {
+      graph.addNode(String(node.id), {
+        x: (Math.random() - 0.5) * 1000,
+        y: (Math.random() - 0.5) * 1000,
+      });
+    }
+    for (const link of filteredData.links) {
+      const sId = String(typeof link.source === 'object' ? link.source.id : link.source);
+      const tId = String(typeof link.target === 'object' ? link.target.id : link.target);
+      if (graph.hasNode(sId) && graph.hasNode(tId)) {
+        try { graph.addEdge(sId, tId); } catch { /* ignore duplicate edges */ }
+      }
+    }
+
+    const settings = forceAtlas2.inferSettings(graph);
+    const supervisor = new FA2LayoutSupervisor(graph, { settings });
+    fa2WorkerRef.current = supervisor;
+    supervisor.start();
+
+    // Run FA2 for a fixed budget then freeze: ~1500 ms gives ≥500 iterations for graphs
+    // up to ~2 k nodes (the supervisor fires ~1 iteration per message round-trip, typically
+    // several hundred per second), which is sufficient for visual convergence.
+    const timerId = setTimeout(() => {
+      supervisor.stop();
+      const positions = new Map<number, { x: number; y: number }>();
+      graph.forEachNode((key: string, attrs: Record<string, unknown>) => {
+        const x = attrs.x as number;
+        const y = attrs.y as number;
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          positions.set(Number(key), { x, y });
+        }
+      });
+      supervisor.kill();
+      fa2WorkerRef.current = null;
+      setFa2Positions(positions);
+    }, 1500);
+
+    return () => {
+      clearTimeout(timerId);
+      fa2WorkerRef.current?.kill();
+      fa2WorkerRef.current = null;
+    };
+  }, [filteredData]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // When focus is cleared, zoom out to show the full visible graph.
   // Guard with simulationReady so this does not fire at mount (focusSet starts null).
@@ -1266,6 +1331,19 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     // Pass empty links to ForceGraph3D — we draw arcs ourselves
     return { nodes: fixedNodes, links: [] as any[] };
   }, [graphMode, filteredData, fileTree, degreeMap, nodeSize, edgeColors, isDark]);
+
+  // Pin nodes at FA2-computed positions so react-force-graph's d3 physics doesn't move them.
+  // Only applies to 2D views above the threshold; 3D keeps its own physics (FA2 has no z-axis).
+  const fa2GraphData = useMemo(() => {
+    if (!fa2Positions || filteredData.nodes.length < LARGE_GRAPH_THRESHOLD) return null;
+    return {
+      nodes: filteredData.nodes.map((n: any) => {
+        const pos = fa2Positions.get(n.id);
+        return pos ? { ...n, fx: pos.x, fy: pos.y } : n;
+      }),
+      links: filteredData.links,
+    };
+  }, [fa2Positions, filteredData]);
 
   const loadFileCode = useCallback((path: string) => {
     const content = fileContents[path];
@@ -2864,11 +2942,26 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
             edgeColors={edgeColors}
             isDark={isDark}
           />
+        ) : filteredData.nodes.length >= LARGE_GRAPH_THRESHOLD && fa2Positions === null ? (
+          // FA2 worker is computing layout; block main-thread d3-force during this window
+          <div
+            className="flex items-center justify-center h-full w-full"
+            style={{ width: dimensions.width - effectiveSidebarW - effectiveCodePanelW, height: dimensions.height }}
+          >
+            <div className="flex flex-col items-center gap-3 text-center px-4">
+              <Loader2 className="w-8 h-8 animate-spin text-purple-400" />
+              <p className={`text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                Pre-computing layout for {filteredData.nodes.length.toLocaleString()} nodes...
+              </p>
+            </div>
+          </div>
         ) : (
           <ForceGraph2D
             ref={fgRef}
+            // onEngineStop fires immediately when cooldownTicks=0 (large graph with fixed positions),
+            // preserving the prior task's auto-fit camera behavior for both paths.
             onEngineStop={() => { setSimulationReady(true); autoFitCamera(); }}
-            graphData={filteredData}
+            graphData={fa2GraphData || filteredData}
             width={dimensions.width - effectiveSidebarW - effectiveCodePanelW}
             height={dimensions.height}
             nodeLabel={(n: any) => {
@@ -2914,9 +3007,10 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
             onNodeHover={setHoverNode}
             d3VelocityDecay={0.4}
             d3AlphaDecay={0.05}
-            // warmupTicks silently pre-computes 30 steps to skip the most chaotic scatter phase; cooldownTicks=120 gives D3 enough rendered frames (with alphaDecay=0.05, convergence needs ~138 total ticks)
-            warmupTicks={30}
-            cooldownTicks={120}
+            // Large graph: positions are pre-computed and pinned (fx/fy), so skip all physics ticks.
+            // Small graph: warmupTicks=30 skips chaotic scatter phase; cooldownTicks=120 lets D3 converge (~138 ticks at alphaDecay=0.05).
+            warmupTicks={fa2GraphData ? 0 : 30}
+            cooldownTicks={fa2GraphData ? 0 : 120}
           />
         )}
 

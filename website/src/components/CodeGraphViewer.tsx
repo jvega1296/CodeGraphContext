@@ -815,6 +815,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     // several hundred per second), which is sufficient for visual convergence.
     const timerId = setTimeout(() => {
       supervisor.stop();
+      // stop() signals the worker but position-update postMessages already in flight may not yet be applied; visually negligible at this time budget but not a hard sync guarantee.
       const positions = new Map<number, { x: number; y: number }>();
       graph.forEachNode((key: string, attrs: Record<string, unknown>) => {
         const x = attrs.x as number;

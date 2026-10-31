@@ -674,13 +674,10 @@ The graph database schema:
 
 Respond ONLY with a JSON object in one of these two shapes:
 
-Flow mode:
-{
-  "mode": "flow",
-  "target": "<primary symbol name the question is about>",
-  "direction": "both",
-  "explanation": "Brief description of what will be traced and why flow mode was chosen"
-}
+Flow mode (direction is "both", "upstream", or "downstream" — see rules above):
+{"mode": "flow", "target": "createOrder", "direction": "both", "explanation": "Tracing the full createOrder flow in both directions to show callers and what it triggers."}
+{"mode": "flow", "target": "publishEvent", "direction": "upstream", "explanation": "Finding what calls publishEvent — upstream only since the question is specifically about callers."}
+{"mode": "flow", "target": "processPayment", "direction": "downstream", "explanation": "Tracing what processPayment triggers — downstream only since the question is about effects."}
 
 Cypher mode:
 {

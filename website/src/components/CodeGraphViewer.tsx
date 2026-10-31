@@ -863,6 +863,20 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     if (focusSet === null && simulationReady) autoFitCamera();
   }, [focusSet, simulationReady, autoFitCamera]);
 
+  // Escape key exits impact focus mode.
+  useEffect(() => {
+    if (!isImpactMode || !impactResult) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setImpactTarget(null);
+        setImpactResult(null);
+        setFocusSet(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isImpactMode, impactResult]);
+
   const nodeCanvasObject = useCallback((node: any, ctx: any, globalScale: number) => {
     if (!visibleNodeTypes.has(node.type)) return;
     if (!Number.isFinite(node.x) || !Number.isFinite(node.y)) return;
@@ -870,17 +884,21 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     const isHovered = hoverNode && node.id === hoverNode.id;
     const isFocused = focusSet ? focusSet.nodes.has(node.id) : true;
     let baseColor = nodeColors[node.type] || nodeColors.Other;
+    // Size multiplier for impact mode: target scales with risk_score, affected nodes scale with depth proximity.
+    let impactSizeFactor = 1.0;
     if (isImpactMode && impactResult) {
       if (node.id === impactTarget?.id) {
         baseColor = '#ef4444'; // Target is Crimson Red
+        impactSizeFactor = 1.5 + (impactResult.risk_score || 0) * 1.5; // 1.5x–3x by risk_score
       } else {
         const affected = impactResult.affected_nodes?.find((n: any) => n.uid === node.id);
         if (affected) {
           baseColor = affected.depth === 1 ? '#f97316' : '#eab308'; // Orange for direct, Yellow for indirect
+          impactSizeFactor = affected.depth === 1 ? 1.7 : 1.3;
         }
       }
     }
-    const radius = node.val * 0.8 * nodeSize * graphAwareNodeScale;
+    const radius = node.val * 0.8 * nodeSize * graphAwareNodeScale * impactSizeFactor;
     const opacity = isFocused ? (isHovered ? 1 : 0.9) : 0.05;
     const isMassive = filteredData.nodes.length > 3000;
 
@@ -974,7 +992,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
 
       default: {
         const degree = degreeMap.get(node.id) || 0;
-        const baseSize = Math.max(3, Math.min(2 + Math.sqrt(degree) * 1.5, 15)) * nodeSize * graphAwareNodeScale;
+        const baseSize = Math.max(3, Math.min(2 + Math.sqrt(degree) * 1.5, 15)) * nodeSize * graphAwareNodeScale * impactSizeFactor;
 
         // Glow for selected/highlighted
         if (isHovered || (selectedFile && node.file === selectedFile && node.type === 'File')) {
@@ -1102,7 +1120,15 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
       }
     }
     const degree = degreeMap.get(node.id) || 0;
-    const radius = Math.max(1.5, (node.val || 2) * 0.6 * nodeSize + degree * 0.15);
+    let r3dFactor = 1.0;
+    if (isImpactMode && impactResult) {
+      if (node.id === impactTarget?.id) r3dFactor = 1.5 + (impactResult.risk_score || 0) * 1.5;
+      else {
+        const aff = impactResult.affected_nodes?.find((n: any) => n.uid === node.id);
+        if (aff) r3dFactor = aff.depth === 1 ? 1.7 : 1.3;
+      }
+    }
+    const radius = Math.max(1.5, (node.val || 2) * 0.6 * nodeSize + degree * 0.15) * r3dFactor;
 
     const sphereGeo = new THREE.SphereGeometry(radius, 16, 12);
     const sphereMat = new THREE.MeshPhongMaterial({
@@ -2148,12 +2174,21 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
                           </div>
 
                           <span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider ${
-                            impactResult.risk_level === 'High' ? 'bg-red-500/20 text-red-400 border border-red-500/20' : 
-                            impactResult.risk_level === 'Medium' ? 'bg-orange-500/20 text-orange-400 border border-orange-500/20' : 
+                            impactResult.risk_level === 'High' ? 'bg-red-500/20 text-red-400 border border-red-500/20' :
+                            impactResult.risk_level === 'Medium' ? 'bg-orange-500/20 text-orange-400 border border-orange-500/20' :
                             'bg-emerald-500/20 text-emerald-400 border border-emerald-500/20'
                           }`}>
                             {impactResult.risk_level} Risk Level
                           </span>
+
+                          {impactResult.risk_score !== undefined && (
+                            <div className="flex items-center gap-2 text-[10px]">
+                              <span className="text-gray-500">Risk Score</span>
+                              <span className={`font-black tabular-nums ${impactResult.risk_score > 0.7 ? 'text-red-400' : impactResult.risk_score > 0.4 ? 'text-orange-400' : 'text-emerald-400'}`}>
+                                {(impactResult.risk_score * 100).toFixed(0)}%
+                              </span>
+                            </div>
+                          )}
                         </div>
 
                         {/* Breakdown Metrics */}
@@ -2882,6 +2917,17 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
         <div className="absolute top-20 left-1/2 -translate-x-1/2 z-[50] w-full flex justify-center px-4">
           <RepositorySummary graphData={data} isIndexed={true} />
         </div>
+
+        {/* Exit Focus Mode — visible when impact analysis is active */}
+        {isImpactMode && impactResult && (
+          <button
+            onClick={() => { setImpactTarget(null); setImpactResult(null); setFocusSet(null); }}
+            className={`absolute top-6 left-1/2 -translate-x-1/2 z-[62] flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold shadow-2xl backdrop-blur-xl border transition-all ${isDark ? 'bg-black/80 border-white/10 text-white hover:bg-red-500/20 hover:border-red-500/30' : 'bg-white/90 border-black/10 text-black hover:bg-red-50 hover:border-red-200'}`}
+          >
+            <X className="w-3.5 h-3.5 text-red-400" />
+            Exit Focus Mode <kbd className="ml-1 text-[9px] text-gray-500 font-mono px-1 py-0.5 rounded border border-current/20">Esc</kbd>
+          </button>
+        )}
 
         {graphMode === 'city3d' ? (
           <>

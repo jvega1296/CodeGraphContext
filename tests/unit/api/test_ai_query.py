@@ -544,3 +544,70 @@ def test_ai_query_flow_mode_downstream_shape(mock_call_llm, mock_code_finder_cls
     # Duplicate path produces only one edge after deduplication
     assert len(res_data["links"]) == 1
     assert res_data["links"][0]["id"] == "src-uid->sink-1:PRODUCES_TO"
+
+
+@patch("codegraphcontext.tools.code_finder.CodeFinder")
+@patch("codegraphcontext.viz.server.call_llm")
+def test_ai_query_flow_mode_resolves_uid_to_element_id(mock_call_llm, mock_code_finder_cls, monkeypatch):
+    """analyze_impact identifies nodes by "uid" (a schema primary-key property), but
+    /api/graph identifies the same nodes by the database's internal element id
+    (_get_eid) -- two different identifier spaces for the same node. Flow mode must
+    resolve every uid to its real element id before returning nodes/links, or the
+    frontend's already-loaded nodes (keyed by element id) never match the flow result
+    at all, and the flow view renders a blank canvas (the live bug this test pins)."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
+
+    mock_call_llm.side_effect = [
+        '{"mode": "flow", "target": "createOrder", "direction": "both", "explanation": "tracing flow"}',
+        "explanation text",
+    ]
+
+    mock_impact_result = {
+        "target": {"name": "createOrder", "type": "Function", "path": "/svc/order.java"},
+        "direction": "both",
+        "nodes": [
+            {"uid": "uid-1", "name": "createOrder", "path": "/svc/order.java", "type": "Function", "role": "target"},
+            {"uid": "uid-2", "name": "OrderTopic", "path": "", "type": "Topic", "role": "downstream"},
+        ],
+        "edges": [
+            {"source_uid": "uid-1", "target_uid": "uid-2", "type": "PRODUCES_TO", "line_number": 42, "direction": "downstream"},
+        ],
+        "cross_repo_hops": [],
+        "unresolved_crossings": [],
+        "impact_score": 3.0,
+        "risk_level": "Low",
+        "risk_breakdown": {},
+        "risk_score": 2.5,
+        "risk_factors": {},
+        "churn_status": "off",
+        "explanations": [],
+    }
+    mock_finder_instance = MagicMock()
+    mock_finder_instance.analyze_impact.return_value = mock_impact_result
+    mock_code_finder_cls.return_value = mock_finder_instance
+
+    # The database resolves each uid to its real element id (_id) -- a different
+    # value than uid, matching how /api/graph's own nodes are identified.
+    mock_session = MagicMock()
+    mock_session.run.return_value = [
+        {"n": {"_id": "4_6510", "uid": "uid-1", "name": "createOrder"}},
+        {"n": {"_id": "4_6514", "uid": "uid-2", "name": "OrderTopic"}},
+    ]
+    mock_db = MagicMock()
+    mock_db.get_driver.return_value.session.return_value.__enter__.return_value = mock_session
+    set_db_manager(mock_db)
+
+    response = client.post("/api/ai_query", json={"query": "how does createOrder work"})
+
+    assert response.status_code == 200
+    res_data = response.json()
+
+    node_ids = {n["id"] for n in res_data["nodes"]}
+    assert node_ids == {"4_6510", "4_6514"}
+    assert "uid-1" not in node_ids
+    assert "uid-2" not in node_ids
+
+    link = res_data["links"][0]
+    assert link["source"] == "4_6510"
+    assert link["target"] == "4_6514"
+    assert link["id"] == "4_6510->4_6514:PRODUCES_TO"

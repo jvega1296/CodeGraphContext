@@ -427,15 +427,37 @@ function computeFlowLayout(
     tiers.get(d)!.push(id);
   }
 
-  // Lay out columns: depth × TIER_SPACING gives x; nodes spaced evenly in y
-  const TIER_SPACING = 280;
+  // Lay out columns left-to-right by depth. A tier with many nodes (common at
+  // depth 0, the seed's own direct neighborhood) is wrapped into a roughly
+  // square sub-column grid instead of one long vertical line -- a single
+  // 100+-node column made the whole layout extremely tall and narrow, forcing
+  // zoomToFit to zoom out so far that every node shrank to an unreadable
+  // sliver. Tier width varies with node count, so tiers are placed by walking
+  // left-to-right and leaving a fixed gap after each tier's actual width,
+  // rather than a fixed per-depth spacing that could let a wide tier overlap
+  // its neighbor.
   const NODE_SPACING = 90;
+  const SUBCOL_SPACING = 140;
+  const TIER_GAP = 160;
   const positions = new Map<number, { x: number; y: number }>();
-  for (const [depth, ids] of tiers) {
-    const x = depth * TIER_SPACING;
-    const totalH = (ids.length - 1) * NODE_SPACING;
-    ids.forEach((id, i) => { positions.set(id, { x, y: i * NODE_SPACING - totalH / 2 }); });
-  }
+  const sortedDepths = Array.from(tiers.keys()).sort((a, b) => a - b);
+  let cursorX = 0;
+  let prevHalfWidth = 0;
+  sortedDepths.forEach((depth, idx) => {
+    const ids = tiers.get(depth)!;
+    const cols = Math.max(1, Math.ceil(Math.sqrt(ids.length)));
+    const rows = Math.ceil(ids.length / cols);
+    const halfWidth = ((cols - 1) * SUBCOL_SPACING) / 2;
+    const totalH = (rows - 1) * NODE_SPACING;
+    const x = idx === 0 ? 0 : cursorX + prevHalfWidth + TIER_GAP + halfWidth;
+    ids.forEach((id, i) => {
+      const col = Math.floor(i / rows);
+      const row = i % rows;
+      positions.set(id, { x: x + col * SUBCOL_SPACING - halfWidth, y: row * NODE_SPACING - totalH / 2 });
+    });
+    cursorX = x;
+    prevHalfWidth = halfWidth;
+  });
   return positions;
 }
 
@@ -1490,22 +1512,31 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     };
   }, [fa2Positions, filteredData]);
 
-  // When flow view is active, overlay computed flow positions (x/y/fx/fy) on matched nodes only.
-  // Setting x AND y (not just fx/fy) ensures zoomToFit reads the correct positions even with 0 ticks.
-  // Non-matched nodes keep their existing positions; they are hidden in nodeCanvasObject anyway.
-  // When flow view exits (isFlowView=false or flowPositions=null), this returns the base data
-  // unchanged, so nodes restore their normal global-layout-driven positions automatically.
+  // When flow view is active, scope the ForceGraph dataset down to just the matched
+  // nodes/links (not the full graph with a subset repositioned): leaving the other
+  // thousands of nodes in the dataset keeps d3-force's simulation perpetually running
+  // (they never stop moving), so onEngineStop -- which the flow-fit zoomToFit call
+  // below depends on -- never reliably fires and the camera never reaches the flow
+  // subset. Every remaining node gets a fixed position (fx/fy) from computeFlowLayout,
+  // so the trimmed simulation has zero kinetic energy and settles immediately.
+  // When flow view exits (isFlowView=false or flowPositions=null), this returns the
+  // base data unchanged, so nodes restore their normal global-layout-driven positions.
   const activeGraphData = useMemo(() => {
     const base = fa2GraphData || filteredData;
     if (!isFlowView || !flowPositions) return base;
-    return {
-      nodes: base.nodes.map((n: any) => {
-        const fp = flowPositions.get(n.id);
-        if (!fp) return n;
+    const matchedNodes = base.nodes
+      .filter((n: any) => flowPositions.has(n.id))
+      .map((n: any) => {
+        const fp = flowPositions.get(n.id)!;
         return { ...n, x: fp.x, y: fp.y, fx: fp.x, fy: fp.y };
-      }),
-      links: base.links,
-    };
+      });
+    const matchedIds = new Set(matchedNodes.map((n: any) => n.id));
+    const matchedLinks = base.links.filter((l: any) => {
+      const u = typeof l.source === 'object' ? l.source.id : l.source;
+      const v = typeof l.target === 'object' ? l.target.id : l.target;
+      return matchedIds.has(u) && matchedIds.has(v);
+    });
+    return { nodes: matchedNodes, links: matchedLinks };
   }, [isFlowView, flowPositions, fa2GraphData, filteredData]);
 
   const loadFileCode = useCallback((path: string) => {

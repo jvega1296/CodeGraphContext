@@ -750,9 +750,60 @@ Cypher mode:
                                 "type": rel["type"],
                             })
 
+            # analyze_impact identifies nodes by "uid" (the schema's primary-key
+            # property), but /api/graph identifies the same nodes by the database's
+            # internal element id (_get_eid: Kuzu/LadybugDB row id, not the uid
+            # property). The frontend only knows about nodes by the latter, since
+            # that's what it already loaded -- without this translation, flow-mode
+            # node ids never match anything the graph has loaded, focusSet ends up
+            # empty, and the flow view renders a blank canvas. Resolve every
+            # uid referenced by the result (nodes and edges) to its real element id
+            # with a single lookup query before building the frontend payload.
+            wanted_uids: set = set()
+            for n in raw_nodes:
+                u = n.get("uid")
+                if u:
+                    wanted_uids.add(u)
+            for e in raw_edges:
+                su, tu = e.get("source_uid"), e.get("target_uid")
+                if su:
+                    wanted_uids.add(su)
+                if tu:
+                    wanted_uids.add(tu)
+
+            uid_to_eid: dict = {}
+            if wanted_uids:
+                with db_manager.get_driver().session(**_read_session_kwargs(db_manager)) as session:
+                    result = session.run("MATCH (n) WHERE n.uid IN $uids RETURN n", uids=list(wanted_uids))
+                    for record in result:
+                        node = record.get("n")
+                        if node is None:
+                            continue
+                        if isinstance(node, dict):
+                            props = {k: v for k, v in node.items() if not k.startswith('_')}
+                        else:
+                            props = {}
+                            for prop_attr in ['properties', '_properties']:
+                                if hasattr(node, prop_attr):
+                                    attr_val = getattr(node, prop_attr)
+                                    if attr_val:
+                                        props = dict(attr_val)
+                                        break
+                            if not props and hasattr(node, 'items'):
+                                try:
+                                    props = dict(node.items())
+                                except Exception:
+                                    pass
+                        node_uid = props.get("uid")
+                        if node_uid:
+                            uid_to_eid[node_uid] = _get_eid(node)
+
+            def _resolve_uid(u):
+                return uid_to_eid.get(u, u) if u else ""
+
             mapped_nodes = [
                 {
-                    "id": n.get("uid") or "",
+                    "id": _resolve_uid(n.get("uid")),
                     "name": n.get("name") or "",
                     "label": n.get("name") or "",
                     "type": n.get("type") or "Unknown",
@@ -765,9 +816,9 @@ Cypher mode:
 
             mapped_links = [
                 {
-                    "id": f"{e.get('source_uid')}->{e.get('target_uid')}:{e.get('type')}",
-                    "source": e.get("source_uid") or "",
-                    "target": e.get("target_uid") or "",
+                    "id": f"{_resolve_uid(e.get('source_uid'))}->{_resolve_uid(e.get('target_uid'))}:{e.get('type')}",
+                    "source": _resolve_uid(e.get("source_uid")),
+                    "target": _resolve_uid(e.get("target_uid")),
                     "type": e.get("type") or "RELATED",
                 }
                 for e in raw_edges

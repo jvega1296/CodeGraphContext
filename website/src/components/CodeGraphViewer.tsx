@@ -377,11 +377,36 @@ function TreeItem({
 // Seed = matched node with the most edges within the matched set.
 // Downstream direction (source → target along edge): depth +1 (columns to the right).
 // Upstream direction (target → source, i.e. callers of seed): depth -1 (columns to the left).
+// Node types that always belong in the default flow view regardless of hop distance:
+// the actual cross-repo wiring (Pub/Sub topics, subscriptions, REST/gRPC endpoints) is
+// exactly what the user asks to see when asking "how does X work across services" --
+// hiding it behind a depth cutoff would defeat the point of asking.
+const ALWAYS_VISIBLE_FLOW_TYPES = new Set(['Topic', 'Subscription', 'Endpoint']);
+
+interface FlowLayout {
+  positions: Map<number, { x: number; y: number }>;
+  // BFS hop distance from the seed (negative = upstream, positive = downstream); drives
+  // the left-to-right tier placement above, not the default-visibility curation below.
+  depths: Map<number, number>;
+  // The default-visible "causal spine": the query target, every node flagged as an
+  // actual repo-crossing hop or wiring type, and every node on the shortest path
+  // connecting them. A full analyze_impact closure can run into the hundreds of
+  // nodes (correct to compute -- a developer asking "how does X work" still wants
+  // every dependency considered) but a depth/degree cutoff alone doesn't curate it
+  // well: this codebase's real call graphs are broad (dozens of direct 1-hop
+  // neighbors) rather than deep, so "everything within 1 hop" was barely smaller
+  // than the full result. The shortest path from target to each cross-repo hop is
+  // what the user actually described wanting to see -- the story, not the neighborhood.
+  spine: Set<number>;
+}
+
 function computeFlowLayout(
   matchedNodeIds: Set<number>,
   matchedLinks: Set<any>,
-): Map<number, { x: number; y: number }> {
-  if (matchedNodeIds.size === 0) return new Map();
+  alwaysVisibleIds: Set<number> = new Set(),
+  targetIds: Set<number> = new Set(),
+): FlowLayout {
+  if (matchedNodeIds.size === 0) return { positions: new Map(), depths: new Map(), spine: new Set() };
 
   const outEdges = new Map<number, number[]>();
   const inEdges = new Map<number, number[]>();
@@ -419,6 +444,41 @@ function computeFlowLayout(
     }
   }
   for (const id of matchedNodeIds) { if (!depths.has(id)) depths.set(id, 0); }
+
+  // Spine: every target plus the shortest path (direction-agnostic -- a cross-repo
+  // hop can sit upstream or downstream of a target) from the nearest target to every
+  // always-visible node. Multi-source BFS: a query target often matches several real
+  // nodes at once (an interface and its implementation, the same method name reused
+  // across repos), and seeding all of them avoids arbitrarily picking just one and
+  // missing the path that actually reaches a given hop from a different target.
+  // Reuses the same adjacency as the depth BFS above, walked undirected since this
+  // is about reachability, not up/downstream framing.
+  const validTargetIds = Array.from(targetIds).filter((id) => matchedNodeIds.has(id));
+  const spineRoots = validTargetIds.length > 0 ? validTargetIds : [seedId];
+  const spine = new Set<number>([...spineRoots, ...alwaysVisibleIds]);
+  if (alwaysVisibleIds.size > 0) {
+    const parent = new Map<number, number>();
+    const spineVisited = new Set<number>(spineRoots);
+    const spineQueue = [...spineRoots];
+    while (spineQueue.length > 0) {
+      const curr = spineQueue.shift()!;
+      for (const next of [...(outEdges.get(curr) ?? []), ...(inEdges.get(curr) ?? [])]) {
+        if (!spineVisited.has(next)) {
+          spineVisited.add(next);
+          parent.set(next, curr);
+          spineQueue.push(next);
+        }
+      }
+    }
+    for (const hopId of alwaysVisibleIds) {
+      if (!spineVisited.has(hopId)) continue; // no path from any target; still shown via alwaysVisibleIds union above
+      let walk = hopId;
+      while (parent.has(walk)) {
+        spine.add(walk);
+        walk = parent.get(walk)!;
+      }
+    }
+  }
 
   // Group nodes by depth tier
   const tiers = new Map<number, number[]>();
@@ -458,7 +518,21 @@ function computeFlowLayout(
     cursorX = x;
     prevHalfWidth = halfWidth;
   });
-  return positions;
+  return { positions, depths, spine };
+}
+
+// File/Module nodes are container-level, not the method-level granularity the flow
+// view wants to default to (a whole file is "el bonchesote" even when it's just one
+// node) -- excluded from the default view even if the BFS spine technically passed
+// through one, since CONTAINS edges can pull a containing file into the path.
+function filterFlowSpineByGranularity(nodes: any[], spine: Set<number>): Set<number> {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const filtered = new Set<number>();
+  for (const id of spine) {
+    const type = byId.get(id)?.type;
+    if (type !== 'File' && type !== 'Module') filtered.add(id);
+  }
+  return filtered;
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
@@ -536,6 +610,11 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   // from impact-mode focus (existing fade-only behavior). Only highlightAIQueryResultNodes sets this true.
   const [isFlowView, setIsFlowView] = useState(false);
   const [flowPositions, setFlowPositions] = useState<Map<number, { x: number; y: number }> | null>(null);
+  const [flowSpine, setFlowSpine] = useState<Set<number> | null>(null);
+  // Default flow-view shows only the causal spine (target, cross-repo hops, and the
+  // shortest path between them) rather than every transitively-reached node; this
+  // expands that to everything matched. Reset to false whenever a new flow result arrives.
+  const [flowShowAll, setFlowShowAll] = useState(false);
   // Ref (not state) so onEngineStop can read the latest nodeIds without a stale closure.
   // Set alongside flowPositions; cleared once consumed by onEngineStop.
   const pendingFlowFitRef = useRef<Set<number> | null>(null);
@@ -956,23 +1035,57 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     if (focusSet === null) {
       setIsFlowView(false);
       setFlowPositions(null);
+      setFlowSpine(null);
     }
   }, [focusSet]);
 
-  // Compute BFS-depth layered layout whenever flow view becomes active with a new focusSet.
-  // Sets pendingFlowFitRef so the next onEngineStop fires zoomToFit against the actual settled
-  // positions -- no fixed timer, no race against the graph re-initializing with new activeGraphData.
+  // Compute BFS-depth layered layout + default-visibility spine whenever flow view
+  // becomes active with a new focusSet. role/is_cross_repo_hop live on aiResponse.nodes
+  // (the raw flow-query response), not on the already-loaded graph's nodes, since
+  // they're specific to this particular analyze_impact result. flowShowAll resets to
+  // false here: a brand-new query should default back to the curated spine, not
+  // inherit "show all" from whatever the previous query ended on.
   useEffect(() => {
     if (!isFlowView || !focusSet || focusSet.nodes.size === 0) {
       setFlowPositions(null);
-      pendingFlowFitRef.current = null;
+      setFlowSpine(null);
       return;
     }
-    const positions = computeFlowLayout(focusSet.nodes, focusSet.links);
-    setFlowPositions(positions);
-    // Store nodeIds so onEngineStop can call zoomToFit with a nodeFilter without a stale closure.
-    pendingFlowFitRef.current = new Set(positions.keys());
-  }, [isFlowView, focusSet]);
+    const responseNodes: any[] = aiResponse?.nodes ?? [];
+    const byId = new Map(responseNodes.map((n: any) => [n.id, n]));
+    // A query target commonly matches several real nodes at once (an interface and
+    // its implementation, the same method name reused across repos/layers) -- collect
+    // all of them rather than keeping just the last one seen.
+    const targetIds = new Set<number>();
+    const alwaysVisibleIds = new Set<number>();
+    for (const id of focusSet.nodes) {
+      const rn = byId.get(id);
+      if (!rn) continue;
+      if (rn.properties?.role === 'target') targetIds.add(id);
+      if (rn.properties?.is_cross_repo_hop || ALWAYS_VISIBLE_FLOW_TYPES.has(rn.type)) alwaysVisibleIds.add(id);
+    }
+    const layout = computeFlowLayout(focusSet.nodes, focusSet.links, alwaysVisibleIds, targetIds);
+    setFlowPositions(layout.positions);
+    setFlowSpine(filterFlowSpineByGranularity(responseNodes, layout.spine));
+    setFlowShowAll(false);
+  }, [isFlowView, focusSet, aiResponse]);
+
+  // The node set actually rendered: the curated spine by default, or everything once
+  // the user asks to see it all. Single source of truth shared by activeGraphData
+  // (what's drawn) and the zoomToFit effect below (what the camera frames) so they
+  // never disagree.
+  const effectiveFlowNodeIds = useMemo(() => {
+    if (!isFlowView || !flowPositions) return null;
+    if (flowShowAll || !flowSpine) return new Set(flowPositions.keys());
+    return flowSpine;
+  }, [isFlowView, flowPositions, flowShowAll, flowSpine]);
+
+  // Sets pendingFlowFitRef so the next onEngineStop fires zoomToFit against the actual
+  // rendered node set -- no fixed timer, no race against the graph re-initializing with
+  // new activeGraphData.
+  useEffect(() => {
+    pendingFlowFitRef.current = effectiveFlowNodeIds;
+  }, [effectiveFlowNodeIds]);
 
   const nodeCanvasObject = useCallback((node: any, ctx: any, globalScale: number) => {
     if (!visibleNodeTypes.has(node.type)) return;
@@ -1137,11 +1250,13 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
 
     // FLOW VIEW: always render labels for matched nodes when the set is small enough to be legible.
     // Threshold of 60: above this the labels overlap at any reasonable zoom; let the zoom gate apply.
-    // This only affects flow view; impact mode and full-graph default keep the existing zoom gate.
+    // Checked against effectiveFlowNodeIds (what's actually drawn, i.e. the curated default
+    // unless "show all" is on) rather than focusSet.nodes (the full analyze_impact result) --
+    // the curated default is usually small enough for labels even when the full result isn't.
     const FLOW_LABEL_LIMIT = 60;
     const showLabel = isHovered ||
       (isFocused && globalScale > (isMassive ? 5.0 : 2.0)) ||
-      (isFlowView && isFocused && focusSet !== null && focusSet.nodes.size <= FLOW_LABEL_LIMIT);
+      (isFlowView && isFocused && !!effectiveFlowNodeIds && effectiveFlowNodeIds.size <= FLOW_LABEL_LIMIT);
 
     if (showLabel) {
       const fontSize = Math.max(2, Math.round((isHovered ? 14 : 10) / globalScale));
@@ -1156,7 +1271,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
       ctx.fillText(node.name || 'Unknown', node.x, labelY);
       if (isFocused && !isMassive) ctx.shadowBlur = 0;
     }
-  }, [filteredData.nodes.length, focusSet, isFlowView, graphAwareNodeScale, hoverNode, nodeColors, nodeSize, selectedFile, visibleNodeTypes, graphMode, degreeMap, pal, isDark, isImpactMode, impactResult, impactTarget]);
+  }, [filteredData.nodes.length, focusSet, isFlowView, effectiveFlowNodeIds, graphAwareNodeScale, hoverNode, nodeColors, nodeSize, selectedFile, visibleNodeTypes, graphMode, degreeMap, pal, isDark, isImpactMode, impactResult, impactTarget]);
 
   const cityNodeThreeObject = useCallback((node: any) => {
     if (!visibleNodeTypes.has(node.type)) return new THREE.Object3D();
@@ -1524,20 +1639,39 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   const activeGraphData = useMemo(() => {
     const base = fa2GraphData || filteredData;
     if (!isFlowView || !flowPositions) return base;
+    // Scope to effectiveFlowNodeIds (the curated default spine, or everything once the
+    // user asks to see it all) -- not just flowPositions, which always has every matched
+    // node so toggling "show all" doesn't need to recompute positions.
+    const idsToRender = effectiveFlowNodeIds ?? flowPositions;
     const matchedNodes = base.nodes
-      .filter((n: any) => flowPositions.has(n.id))
+      .filter((n: any) => flowPositions.has(n.id) && idsToRender.has(n.id))
       .map((n: any) => {
         const fp = flowPositions.get(n.id)!;
         return { ...n, x: fp.x, y: fp.y, fx: fp.x, fy: fp.y };
       });
     const matchedIds = new Set(matchedNodes.map((n: any) => n.id));
-    const matchedLinks = base.links.filter((l: any) => {
-      const u = typeof l.source === 'object' ? l.source.id : l.source;
-      const v = typeof l.target === 'object' ? l.target.id : l.target;
-      return matchedIds.has(u) && matchedIds.has(v);
-    });
+    // d3-force's forceLink only resolves a link's source/target from a plain id into
+    // a node object when it ISN'T already an object (see initializeNodes() in d3-force
+    // forceLink.js: `if (typeof link.source !== "object") link.source = find(...)`).
+    // Reusing link objects from the full graph (whose source/target were already
+    // resolved against the full 5016-node set) left them pointing at stale node
+    // objects that no longer exist in this smaller flow dataset -- every line
+    // rendered between the wrong, leftover full-graph positions instead of the new
+    // flow-layout positions. Rebuilding each link with plain string ids forces a
+    // fresh resolution against the current matchedNodes.
+    const matchedLinks = base.links
+      .filter((l: any) => {
+        const u = typeof l.source === 'object' ? l.source.id : l.source;
+        const v = typeof l.target === 'object' ? l.target.id : l.target;
+        return matchedIds.has(u) && matchedIds.has(v);
+      })
+      .map((l: any) => ({
+        ...l,
+        source: typeof l.source === 'object' ? l.source.id : l.source,
+        target: typeof l.target === 'object' ? l.target.id : l.target,
+      }));
     return { nodes: matchedNodes, links: matchedLinks };
-  }, [isFlowView, flowPositions, fa2GraphData, filteredData]);
+  }, [isFlowView, flowPositions, effectiveFlowNodeIds, fa2GraphData, filteredData]);
 
   const loadFileCode = useCallback((path: string) => {
     const content = fileContents[path];
@@ -1978,6 +2112,13 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   const highlightAIQueryResultNodes = useCallback((responseObj = aiResponse) => {
     if (!responseObj || !responseObj.nodes) return;
 
+    // The chat panel (the actual AI-query UI) calls this directly without ever updating
+    // aiResponse state -- only the older inline-input path did. The flow-view spine
+    // computation reads aiResponse.nodes for role/is_cross_repo_hop (see the effect
+    // computing flowSpine), so without this it silently saw aiResponse=null and fell
+    // back to showing everything, no matter what responseObj actually contained.
+    if (responseObj !== aiResponse) setAiResponse(responseObj);
+
     const returnedNodeIds = new Set(responseObj.nodes.map((n: any) => n.id));
     const pathNodes = new Set<any>();
     const pathLinks = new Set<any>();
@@ -2065,7 +2206,11 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   }, [highlightAIQueryResultNodes]);
 
   const getLinkColor = useCallback((link: any) => {
-    const isFocused = focusSet ? focusSet.links.has(link) : true;
+    // In flow view, activeGraphData.links IS already exactly the matched set (see
+    // activeGraphData above) -- every link object there is freshly rebuilt each time,
+    // so a reference-equality check against focusSet.links (built once, elsewhere)
+    // would never match. isFlowView alone is the correct "is this focused" signal here.
+    const isFocused = isFlowView ? true : (focusSet ? focusSet.links.has(link) : true);
     const baseColor = edgeColors[link.type] || '#ffffff';
 
     // FLOW VIEW: fully hide non-matched links (match the full-hide approach for nodes).
@@ -3013,6 +3158,34 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
           </button>
         )}
 
+        {/* Flow-view curation toggle — the AI-query flow defaults to the causal spine
+            (target, cross-repo hops, immediate neighbors) rather than every reached node. */}
+        {isFlowView && flowPositions && effectiveFlowNodeIds && (
+          <div className={`absolute top-6 left-1/2 -translate-x-1/2 z-[62] flex items-center gap-3 px-4 py-2 rounded-xl text-xs font-bold shadow-2xl backdrop-blur-xl border ${isDark ? 'bg-black/80 border-white/10 text-white' : 'bg-white/90 border-black/10 text-black'}`}>
+            <span>
+              {flowShowAll
+                ? `Showing all ${flowPositions.size} nodes`
+                : `Showing ${effectiveFlowNodeIds.size} of ${flowPositions.size} nodes`}
+            </span>
+            {!flowShowAll && effectiveFlowNodeIds.size < flowPositions.size && (
+              <button
+                onClick={() => setFlowShowAll(true)}
+                className="px-2 py-0.5 rounded-md bg-purple-500/20 text-purple-300 hover:bg-purple-500/30 transition-colors"
+              >
+                Show all
+              </button>
+            )}
+            {flowShowAll && (
+              <button
+                onClick={() => setFlowShowAll(false)}
+                className="px-2 py-0.5 rounded-md bg-purple-500/20 text-purple-300 hover:bg-purple-500/30 transition-colors"
+              >
+                Show relevant only
+              </button>
+            )}
+          </div>
+        )}
+
         {graphMode === 'city3d' ? (
           <>
 
@@ -3150,10 +3323,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
             }
             linkDirectionalParticleWidth={lineWidth * 1.5}
             linkDirectionalParticleSpeed={0.005}
-            linkDirectionalArrowLength={(link: any) => {
-              if (!isFlowView || !focusSet) return 0;
-              return focusSet.links.has(link) ? 6 : 0;
-            }}
+            linkDirectionalArrowLength={() => (isFlowView ? 6 : 0)}
             linkDirectionalArrowRelPos={1}
             linkDirectionalArrowColor={(link: any) => edgeColors[link.type] || '#ffffff'}
             nodeCanvasObject={nodeCanvasObject}

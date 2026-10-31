@@ -801,6 +801,19 @@ Cypher mode:
             def _resolve_uid(u):
                 return uid_to_eid.get(u, u) if u else ""
 
+            # Nodes directly on a repo-crossing hop (a Pub/Sub producer/consumer pair),
+            # independent of "role" (role only distinguishes target/upstream/downstream,
+            # not which specific nodes are the wire crossing itself). The frontend uses
+            # this -- along with "role" -- to decide what to show by default: the full
+            # closure is correct to compute, but a developer asking "how does X work"
+            # wants the causal spine, not every transitively-reached node.
+            cross_repo_hop_uids: set = set()
+            for hop in impact_result.get("cross_repo_hops", []):
+                if hop.get("from_uid"):
+                    cross_repo_hop_uids.add(hop["from_uid"])
+                if hop.get("to_uid"):
+                    cross_repo_hop_uids.add(hop["to_uid"])
+
             mapped_nodes = [
                 {
                     "id": _resolve_uid(n.get("uid")),
@@ -809,7 +822,10 @@ Cypher mode:
                     "type": n.get("type") or "Unknown",
                     "file": n.get("path") or "",
                     "val": 4 if (n.get("type") or "") in _FLOW_VAL4_TYPES else 2,
-                    "properties": {},
+                    "properties": {
+                        "role": n.get("role"),
+                        "is_cross_repo_hop": n.get("uid") in cross_repo_hop_uids,
+                    },
                 }
                 for n in raw_nodes
             ]

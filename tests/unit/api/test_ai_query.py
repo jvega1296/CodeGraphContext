@@ -150,32 +150,32 @@ def test_call_llm_with_cheaperinference_defaults(mock_post, monkeypatch):
 @patch("codegraphcontext.viz.server.call_llm")
 def test_ai_query_success(mock_call_llm, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
-    
+
     mock_call_llm.side_effect = [
         '{"cypher_query": "MATCH (n) RETURN n", "explanation": "translating test"}',
         "This is the explanation of the results."
     ]
-    
+
     mock_db = MagicMock()
     mock_driver = MagicMock()
     mock_session = MagicMock()
     mock_result = MagicMock()
-    
+
     mock_record = MagicMock()
     mock_node_dict = {"_label": "Class", "name": "TestClass", "path": "/path/to/test"}
     mock_record.values.return_value = [mock_node_dict]
     mock_record.items.return_value = [("n", mock_node_dict)]
     mock_record.get.return_value = mock_node_dict
-    
+
     mock_result.__iter__.return_value = [mock_record]
-    
+
     mock_session.run.return_value = mock_result
     mock_driver.session.return_value.__enter__.return_value = mock_session
     mock_db.get_driver.return_value = mock_driver
     set_db_manager(mock_db)
-    
+
     response = client.post("/api/ai_query", json={"query": "test query"})
-    
+
     assert response.status_code == 200
     res_data = response.json()
     assert res_data["success"] is True
@@ -183,3 +183,202 @@ def test_ai_query_success(mock_call_llm, monkeypatch):
     assert res_data["explanation"] == "This is the explanation of the results."
     assert len(res_data["nodes"]) > 0
     assert res_data["nodes"][0]["name"] == "TestClass"
+
+
+@patch("codegraphcontext.tools.code_finder.CodeFinder")
+@patch("codegraphcontext.viz.server.call_llm")
+def test_ai_query_flow_mode_happy_path(mock_call_llm, mock_code_finder_cls, monkeypatch):
+    """Flow mode routes through analyze_impact and maps nodes/links correctly."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
+
+    mock_call_llm.side_effect = [
+        '{"mode": "flow", "target": "createOrder", "direction": "both", "explanation": "tracing flow"}',
+        "The createOrder process works as follows..."
+    ]
+
+    # analyze_impact returns direction="both" shape: nodes + edges
+    mock_impact_result = {
+        "target": {"name": "createOrder", "type": "Function", "path": "/svc/order.java"},
+        "direction": "both",
+        "nodes": [
+            {"uid": "uid-1", "name": "createOrder", "path": "/svc/order.java", "type": "Function", "role": "target"},
+            {"uid": "uid-2", "name": "OrderTopic", "path": "", "type": "Topic", "role": "downstream"},
+            {"uid": "uid-3", "name": "handleOrder", "path": "/svc/consumer.java", "type": "Function", "role": "downstream"},
+        ],
+        "edges": [
+            {"source_uid": "uid-1", "target_uid": "uid-2", "type": "PRODUCES_TO", "line_number": 42, "direction": "downstream"},
+            {"source_uid": "uid-2", "target_uid": "uid-3", "type": "CONSUMES_FROM", "line_number": 0, "direction": "downstream"},
+        ],
+        "cross_repo_hops": [],
+        "unresolved_crossings": [],
+        "impact_score": 3.0,
+        "risk_level": "Low",
+        "risk_breakdown": {"depth_score": 1.0, "module_score": 1.0, "criticality_score": 1.0, "churn_score": 0.0},
+        "risk_score": 2.5,
+        "risk_factors": {"security_sensitivity": 0.0, "caller_count": 0.0, "community_crossing": 0.0, "test_coverage": 0.0, "churn": 0.0},
+        "churn_status": "off",
+        "explanations": [],
+    }
+
+    mock_finder_instance = MagicMock()
+    mock_finder_instance.analyze_impact.return_value = mock_impact_result
+    mock_code_finder_cls.return_value = mock_finder_instance
+
+    mock_db = MagicMock()
+    set_db_manager(mock_db)
+
+    response = client.post("/api/ai_query", json={"query": "how does createOrder work"})
+
+    assert response.status_code == 200
+    res_data = response.json()
+    assert res_data["success"] is True
+    assert "createOrder" in res_data["cypher_query"]
+    assert "both" in res_data["cypher_query"]
+    assert res_data["translation_explanation"] == "tracing flow"
+    assert res_data["explanation"] == "The createOrder process works as follows..."
+
+    # Verify analyze_impact was called with correct args
+    mock_finder_instance.analyze_impact.assert_called_once_with(
+        target="createOrder",
+        direction="both",
+        max_wire_hops=2,
+    )
+
+    # Nodes should be mapped to frontend shape
+    assert len(res_data["nodes"]) == 3
+    node_by_uid = {n["id"]: n for n in res_data["nodes"]}
+
+    # Function node -> val=2
+    fn_node = node_by_uid["uid-1"]
+    assert fn_node["name"] == "createOrder"
+    assert fn_node["type"] == "Function"
+    assert fn_node["val"] == 2
+
+    # Topic node -> val=4
+    topic_node = node_by_uid["uid-2"]
+    assert topic_node["name"] == "OrderTopic"
+    assert topic_node["type"] == "Topic"
+    assert topic_node["val"] == 4
+
+    # Links should be mapped correctly
+    assert len(res_data["links"]) == 2
+    link_ids = {lnk["id"] for lnk in res_data["links"]}
+    assert "uid-1->uid-2:PRODUCES_TO" in link_ids
+    assert "uid-2->uid-3:CONSUMES_FROM" in link_ids
+    for lnk in res_data["links"]:
+        assert set(lnk.keys()) == {"id", "source", "target", "type"}
+
+
+@patch("codegraphcontext.tools.code_finder.CodeFinder")
+@patch("codegraphcontext.viz.server.call_llm")
+def test_ai_query_flow_mode_warning(mock_call_llm, mock_code_finder_cls, monkeypatch):
+    """Flow mode surfaces analyze_impact warning as explanation when target is not found."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
+
+    mock_call_llm.side_effect = [
+        '{"mode": "flow", "target": "nonExistentSymbol", "direction": "both", "explanation": "tracing flow"}',
+    ]
+
+    mock_impact_result = {
+        "target": {"name": "nonExistentSymbol", "type": "Unknown", "path": ""},
+        "direction": "both",
+        "nodes": [],
+        "edges": [],
+        "warning": "No code symbol or file named 'nonExistentSymbol' was found in the graph.",
+        "cross_repo_hops": [],
+        "unresolved_crossings": [],
+        "impact_score": 0.0,
+        "risk_level": "Low",
+    }
+
+    mock_finder_instance = MagicMock()
+    mock_finder_instance.analyze_impact.return_value = mock_impact_result
+    mock_code_finder_cls.return_value = mock_finder_instance
+
+    mock_db = MagicMock()
+    set_db_manager(mock_db)
+
+    response = client.post("/api/ai_query", json={"query": "how does nonExistentSymbol work"})
+
+    assert response.status_code == 200
+    res_data = response.json()
+    assert res_data["success"] is True
+    # Warning becomes the explanation -- LLM explanation call is skipped
+    expected_warning = "No code symbol or file named 'nonExistentSymbol' was found in the graph."
+    assert res_data["explanation"] == expected_warning
+    assert res_data["nodes"] == []
+    assert res_data["links"] == []
+    # Only one LLM call (translation); no second call for explanation when warning
+    assert mock_call_llm.call_count == 1
+
+
+@patch("codegraphcontext.tools.code_finder.CodeFinder")
+@patch("codegraphcontext.viz.server.call_llm")
+def test_ai_query_flow_mode_val_types(mock_call_llm, mock_code_finder_cls, monkeypatch):
+    """Flow mode maps val=4 for Repository/Class/Interface/Trait/Topic/Subscription/Endpoint, val=2 for others."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
+
+    mock_call_llm.side_effect = [
+        '{"mode": "flow", "target": "someTarget", "direction": "both", "explanation": ""}',
+        "explanation text",
+    ]
+
+    val4_types = ["Repository", "Class", "Interface", "Trait", "Topic", "Subscription", "Endpoint"]
+    val2_types = ["Function", "File", "Module", "Struct", "Enum", "Other"]
+
+    nodes = [
+        {"uid": f"uid-{i}", "name": t, "path": "", "type": t, "role": "downstream"}
+        for i, t in enumerate(val4_types + val2_types)
+    ]
+
+    mock_finder_instance = MagicMock()
+    mock_finder_instance.analyze_impact.return_value = {
+        "target": {"name": "someTarget", "type": "Function", "path": ""},
+        "direction": "both",
+        "nodes": nodes,
+        "edges": [],
+        "cross_repo_hops": [],
+        "risk_level": "Low",
+        "explanations": [],
+    }
+    mock_code_finder_cls.return_value = mock_finder_instance
+    mock_db = MagicMock()
+    set_db_manager(mock_db)
+
+    response = client.post("/api/ai_query", json={"query": "how does someTarget work"})
+    assert response.status_code == 200
+    res_nodes = {n["type"]: n["val"] for n in response.json()["nodes"]}
+
+    for t in val4_types:
+        assert res_nodes[t] == 4, f"Expected val=4 for type {t}, got {res_nodes[t]}"
+    for t in val2_types:
+        assert res_nodes[t] == 2, f"Expected val=2 for type {t}, got {res_nodes[t]}"
+
+
+@patch("codegraphcontext.viz.server.call_llm")
+def test_ai_query_cypher_mode_explicit(mock_call_llm, monkeypatch):
+    """Cypher mode with explicit mode field still works exactly as before."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
+
+    mock_call_llm.side_effect = [
+        '{"mode": "cypher", "cypher_query": "MATCH (n:Class) RETURN n LIMIT 10", "explanation": "list classes"}',
+        "Here are the classes."
+    ]
+
+    mock_db = MagicMock()
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = []
+    mock_session.run.return_value = mock_result
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    mock_db.get_driver.return_value = mock_driver
+    set_db_manager(mock_db)
+
+    response = client.post("/api/ai_query", json={"query": "list all classes"})
+    assert response.status_code == 200
+    res_data = response.json()
+    assert res_data["success"] is True
+    assert res_data["cypher_query"] == "MATCH (n:Class) RETURN n LIMIT 10"
+    assert res_data["translation_explanation"] == "list classes"
+    assert res_data["explanation"] == "Here are the classes."

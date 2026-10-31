@@ -618,7 +618,7 @@ class AIQueryRequest(BaseModel):
 async def ai_query(request: AIQueryRequest):
     if not db_manager:
         raise HTTPException(status_code=500, detail="Database not initialized")
-        
+
     vertex_project = os.getenv("ANTHROPIC_VERTEX_PROJECT_ID")
     gemini_key = os.getenv("GEMINI_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -635,13 +635,19 @@ async def ai_query(request: AIQueryRequest):
                 "Please set one in your configuration or .env."
             )
         )
-        
+
     query = request.query
     repo_path = request.repo_path
-    
-    translation_prompt = """You are an expert graph database administrator. Translate the user's natural language question about a codebase into a valid read-only Cypher query.
 
-The graph database represents the codebase structure with the following schema:
+    translation_prompt = """You are an expert graph database administrator. Answer a question about a codebase by choosing the right analysis mode.
+
+Choose one of two modes:
+
+**Mode "flow"**: Use for questions asking how a feature/process/system works end-to-end: "how does X work", "show me the flow of X", "what happens when X runs", "trace X", "explain the X process". Extract the primary symbol name (function, class, or service) as "target". For direction: default to "both" for general flow understanding; use "upstream" only when the question is specifically "what calls X"; use "downstream" only when specifically "what does X trigger/produce".
+
+**Mode "cypher"**: Use for direct structural/counting/listing questions: "list all classes", "how many functions call X", "what are the dependencies of Y", "show nodes of type Z".
+
+The graph database schema:
 ### Nodes & Properties:
 * **`Repository`**: `name` (string), `path` (string, absolute path), `is_dependency` (boolean)
 * **`File`**: `name` (string), `path` (string, absolute path), `relative_path` (string), `is_dependency` (boolean)
@@ -649,6 +655,9 @@ The graph database represents the codebase structure with the following schema:
 * **`Class`**: `name` (string), `path` (string, absolute path), `line_number` (int), `end_line` (int), `bases` (list of strings), `decorators` (list of strings), `lang` (string), `source` (string), `is_dependency` (boolean)
 * **`Interface`**, **`Struct`**, **`Enum`**, **`Trait`**: similar properties to Class/Function
 * **`Module`**: `name` (string)
+* **`Topic`**: `name` (string) — GCP Pub/Sub topic connecting microservices across service boundaries
+* **`Subscription`**: `name` (string) — GCP Pub/Sub subscription attached to a Topic
+* **`Endpoint`**: `path` (string) — REST or gRPC endpoint served or invoked by a service
 
 ### Relationships:
 * **`CONTAINS`**: (Repository)-[:CONTAINS]->(File), (File)-[:CONTAINS]->(Function), (File)-[:CONTAINS]->(Class)
@@ -656,8 +665,31 @@ The graph database represents the codebase structure with the following schema:
 * **`IMPORTS`**: (File)-[:IMPORTS]->(Module)
 * **`INHERITS`**: (Class)-[:INHERITS]->(Class)
 * **`IMPLEMENTS`**: (Class)-[:IMPLEMENTS]->(Interface)
+* **`PRODUCES_TO`**: (Function)-[:PRODUCES_TO]->(Topic) — function publishes a message to a Pub/Sub topic
+* **`CONSUMES_FROM`**: (Function)-[:CONSUMES_FROM]->(Subscription or Topic) — function consumes messages from a subscription or topic
+* **`SERVES`**: (Function)-[:SERVES]->(Endpoint) — function is the handler for an HTTP/gRPC endpoint
+* **`INVOKES`**: (Function)-[:INVOKES]->(Endpoint) — function calls an HTTP/gRPC endpoint
+* **`BACKED_BY`**: (Topic)-[:BACKED_BY]->(Class) — Topic is backed by a Terraform resource (Class node)
+* **`HAS_SUBSCRIPTION`**: (Topic)-[:HAS_SUBSCRIPTION]->(Subscription) — Topic has an attached Subscription
 
-### Query Writing Rules:
+Respond ONLY with a JSON object in one of these two shapes:
+
+Flow mode:
+{
+  "mode": "flow",
+  "target": "<primary symbol name the question is about>",
+  "direction": "both",
+  "explanation": "Brief description of what will be traced and why flow mode was chosen"
+}
+
+Cypher mode:
+{
+  "mode": "cypher",
+  "cypher_query": "MATCH ... RETURN n, rel, m LIMIT 100",
+  "explanation": "Brief description of what this Cypher query does"
+}
+
+### Cypher Query Rules (cypher mode only):
 1. Only write SELECT/MATCH read-only queries. Do NOT use CREATE, MERGE, DELETE, SET, REMOVE, or other modifying keywords.
 2. Return nodes using the variable names `n` and `m`, and relationships using `rel` where possible. This is critical for the visualizer.
    Example: MATCH (n:Class)-[rel:INHERITS]->(m:Class) RETURN n, rel, m
@@ -665,61 +697,171 @@ The graph database represents the codebase structure with the following schema:
 4. If the user asks about dependencies or paths, try to return paths using variables, and return nodes/relationships.
 5. Make property matches case-insensitive or fuzzy if appropriate (e.g. using `toLower(n.name) CONTAINS 'auth'` or `n.name =~ '(?i).*auth.*'`).
 6. If the user is querying a specific repository, you can filter by `Repository.path` or `Repository.name` if path is supplied.
-
-Respond ONLY with a JSON object in this format:
-{
-  "cypher_query": "MATCH ... RETURN n, rel, m LIMIT 100",
-  "explanation": "Brief description of what this Cypher query does"
-}
 """
-    
+
+    # Types that receive val=4 (large node visual weight), matching get_graph()/parse_node()
+    _FLOW_VAL4_TYPES = frozenset({'Repository', 'Class', 'Interface', 'Trait', 'Topic', 'Subscription', 'Endpoint'})
+
     try:
-        # Call LLM to get Cypher
+        # Step 1: Call LLM to determine mode and translate query
         llm_response = call_llm(translation_prompt, query)
         parsed_response = parse_json_from_llm(llm_response)
-        cypher_query = parsed_response.get("cypher_query", "")
         translation_explanation = parsed_response.get("explanation", "")
-        
-        if not cypher_query:
-            raise ValueError("No Cypher query was generated by the AI.")
-            
-        # Validate Cypher
-        if not _is_read_only_cypher(cypher_query):
-            raise HTTPException(
-                status_code=400,
-                detail=f"The generated Cypher query was rejected for safety reasons: {read_only_rejection_message()}"
-            )
-            
-        # Step 2: Run Cypher query
-        nodes_dict = {}
-        edges = []
-        records_data = []
+        mode = parsed_response.get("mode", "cypher")
 
-        with db_manager.get_driver().session(**_read_session_kwargs(db_manager)) as session:
-            result = session.run(cypher_query)
-            for record in result:
-                # Store truncated record data for explanation phase
-                record_dict = {}
-                for k, v in record.items():
-                    if isinstance(v, dict):
-                        record_dict[k] = {prop_k: (prop_v[:200] + "..." if isinstance(prop_v, str) and len(prop_v) > 200 else prop_v) for prop_k, prop_v in v.items()}
-                    elif hasattr(v, 'properties'):
-                        props = dict(v.properties)
-                        record_dict[k] = {prop_k: (prop_v[:200] + "..." if isinstance(prop_v, str) and len(prop_v) > 200 else prop_v) for prop_k, prop_v in props.items()}
-                    else:
-                        record_dict[k] = str(v)[:200] + "..." if isinstance(v, str) and len(v) > 200 else v
-                records_data.append(record_dict)
-                
-                # Parse elements for visualization
-                for val in record.values():
-                    parse_element(val, nodes_dict, edges)
-                    
-        # Truncate results for LLM context (e.g. limit to first 30 records to save tokens)
-        results_for_explanation = records_data[:30]
-        results_json = json.dumps(results_for_explanation, indent=2)
-        
-        # Step 3: Generate Explanation
-        explanation_prompt = f"""You are an expert software developer and repository assistant. Explain the answer to the user's question about the codebase based on the query results.
+        if mode == "flow":
+            from ..tools.code_finder import CodeFinder
+            target = parsed_response.get("target", "")
+            direction = parsed_response.get("direction", "both")
+
+            code_finder = CodeFinder(db_manager)
+            impact_result = code_finder.analyze_impact(
+                target=target,
+                direction=direction,
+                max_wire_hops=2,
+            )
+
+            cypher_query_display = f"analyze_impact(target={target}, direction={direction}, max_wire_hops=2)"
+
+            # Surface warning as explanation when the target symbol wasn't found
+            if "warning" in impact_result:
+                return {
+                    "success": True,
+                    "cypher_query": cypher_query_display,
+                    "translation_explanation": translation_explanation,
+                    "explanation": impact_result["warning"],
+                    "nodes": [],
+                    "links": [],
+                }
+
+            # direction="both" returns "nodes"/"edges"; "upstream"/"downstream" returns
+            # "affected_nodes"/"propagation_paths" -- handle both shapes.
+            raw_nodes = impact_result.get("nodes") or impact_result.get("affected_nodes", [])
+            raw_edges = list(impact_result.get("edges") or [])
+            if not raw_edges:
+                seen_edge_keys: set = set()
+                for path in impact_result.get("propagation_paths", []):
+                    p_nodes = path["nodes"]
+                    p_rels = path["relationships"]
+                    for i, rel in enumerate(p_rels):
+                        key = (p_nodes[i]["uid"], p_nodes[i + 1]["uid"], rel["type"])
+                        if key not in seen_edge_keys:
+                            seen_edge_keys.add(key)
+                            raw_edges.append({
+                                "source_uid": p_nodes[i]["uid"],
+                                "target_uid": p_nodes[i + 1]["uid"],
+                                "type": rel["type"],
+                            })
+
+            mapped_nodes = [
+                {
+                    "id": n.get("uid") or "",
+                    "name": n.get("name") or "",
+                    "label": n.get("name") or "",
+                    "type": n.get("type") or "Unknown",
+                    "file": n.get("path") or "",
+                    "val": 4 if (n.get("type") or "") in _FLOW_VAL4_TYPES else 2,
+                    "properties": {},
+                }
+                for n in raw_nodes
+            ]
+
+            mapped_links = [
+                {
+                    "id": f"{e.get('source_uid')}->{e.get('target_uid')}:{e.get('type')}",
+                    "source": e.get("source_uid") or "",
+                    "target": e.get("target_uid") or "",
+                    "type": e.get("type") or "RELATED",
+                }
+                for e in raw_edges
+            ]
+
+            # Step 3: Generate explanation from flow-derived data
+            flow_data_for_explanation = {
+                "target": impact_result.get("target", {}),
+                "nodes_count": len(raw_nodes),
+                "nodes": [
+                    {"name": n.get("name"), "type": n.get("type"), "path": n.get("path")}
+                    for n in raw_nodes[:30]
+                ],
+                "cross_repo_hops": impact_result.get("cross_repo_hops", [])[:10],
+                "risk_level": impact_result.get("risk_level", ""),
+                "impact_explanations": impact_result.get("explanations", [])[:15],
+            }
+            results_json = json.dumps(flow_data_for_explanation, indent=2)
+
+            explanation_prompt = f"""You are an expert software developer and repository assistant. Explain the answer to the user's question about the codebase based on the query results.
+
+User Question: {query}
+Analysis Executed: {cypher_query_display}
+Query Results (truncated if large):
+{results_json}
+
+Write a clear, concise, and professional explanation of the results in Markdown format.
+Focus on explaining:
+1. What the query found.
+2. The architectural relationships between the components.
+3. How this answers the user's question.
+
+After your explanation, provide a section:
+### Context-Aware Recommendations
+Suggest 2-3 specific follow-up questions or related areas the user might want to explore based on this result. Keep suggestions bulleted and actionable.
+"""
+            explanation = call_llm(explanation_prompt, "Explain the results.")
+
+            return {
+                "success": True,
+                "cypher_query": cypher_query_display,
+                "translation_explanation": translation_explanation,
+                "explanation": explanation,
+                "nodes": mapped_nodes,
+                "links": mapped_links,
+            }
+
+        else:
+            # Cypher mode: existing behavior unchanged
+            cypher_query = parsed_response.get("cypher_query", "")
+
+            if not cypher_query:
+                raise ValueError("No Cypher query was generated by the AI.")
+
+            # Validate Cypher
+            if not _is_read_only_cypher(cypher_query):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"The generated Cypher query was rejected for safety reasons: {read_only_rejection_message()}"
+                )
+
+            # Step 2: Run Cypher query
+            nodes_dict = {}
+            edges = []
+            records_data = []
+
+            with db_manager.get_driver().session(**_read_session_kwargs(db_manager)) as session:
+                result = session.run(cypher_query)
+                for record in result:
+                    # Store truncated record data for explanation phase
+                    record_dict = {}
+                    for k, v in record.items():
+                        if isinstance(v, dict):
+                            record_dict[k] = {prop_k: (prop_v[:200] + "..." if isinstance(prop_v, str) and len(prop_v) > 200 else prop_v) for prop_k, prop_v in v.items()}
+                        elif hasattr(v, 'properties'):
+                            props = dict(v.properties)
+                            record_dict[k] = {prop_k: (prop_v[:200] + "..." if isinstance(prop_v, str) and len(prop_v) > 200 else prop_v) for prop_k, prop_v in props.items()}
+                        else:
+                            record_dict[k] = str(v)[:200] + "..." if isinstance(v, str) and len(v) > 200 else v
+                    records_data.append(record_dict)
+
+                    # Parse elements for visualization
+                    for val in record.values():
+                        parse_element(val, nodes_dict, edges)
+
+            # Truncate results for LLM context (e.g. limit to first 30 records to save tokens)
+            results_for_explanation = records_data[:30]
+            results_json = json.dumps(results_for_explanation, indent=2)
+
+            # Step 3: Generate Explanation
+            explanation_prompt = f"""You are an expert software developer and repository assistant. Explain the answer to the user's question about the codebase based on the query results.
 
 User Question: {query}
 Cypher Query Executed: {cypher_query}
@@ -736,17 +878,17 @@ After your explanation, provide a section:
 ### Context-Aware Recommendations
 Suggest 2-3 specific follow-up questions or related areas the user might want to explore based on this result. Keep suggestions bulleted and actionable.
 """
-        explanation = call_llm(explanation_prompt, "Explain the results.")
-        
-        return {
-            "success": True,
-            "cypher_query": cypher_query,
-            "translation_explanation": translation_explanation,
-            "explanation": explanation,
-            "nodes": list(nodes_dict.values()),
-            "links": edges
-        }
-        
+            explanation = call_llm(explanation_prompt, "Explain the results.")
+
+            return {
+                "success": True,
+                "cypher_query": cypher_query,
+                "translation_explanation": translation_explanation,
+                "explanation": explanation,
+                "nodes": list(nodes_dict.values()),
+                "links": edges,
+            }
+
     except HTTPException:
         # Preserve intentional HTTP errors (e.g. the 400 raised above when the
         # generated Cypher is not read-only); re-wrapping them as 500 made a

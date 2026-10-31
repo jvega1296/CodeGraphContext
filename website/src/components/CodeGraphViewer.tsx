@@ -2816,7 +2816,14 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
                 repoPath={repoPathParam}
                 isDark={isDark}
                 onGraphResult={handleChatPanelGraphResult}
-                onClose={() => setShowChatPanel(false)}
+                onClose={() => {
+                  setShowChatPanel(false);
+                  // Closing the panel after an AI query highlighted a result
+                  // subset must also clear that highlight -- otherwise every
+                  // other node stays dimmed to near-zero opacity with no way
+                  // back to the full graph short of reloading the page.
+                  setFocusSet(null);
+                }}
               />
             </motion.div>
           )}

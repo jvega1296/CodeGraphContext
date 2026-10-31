@@ -377,7 +377,19 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
 
     if vertex_project:
         from anthropic import AnthropicVertex
-        client = AnthropicVertex()
+        # httpx2's default SSL context loads SSL_CERT_FILE/SSL_CERT_DIR
+        # verbatim when set, which breaks on machines behind a corporate
+        # TLS-inspecting proxy whose exported CA bundle isn't a loadable
+        # cafile for this code path (confirmed via a live reproduction:
+        # ssl.SSLError: [X509: NO_CERTIFICATE_OR_CRL_FOUND]). truststore
+        # delegates certificate verification to the OS's own trust store
+        # instead, which is what actually has the proxy's CA installed as
+        # a trusted root on a managed corporate machine.
+        import ssl
+        import truststore
+        import httpx2
+        http_client = httpx2.Client(verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+        client = AnthropicVertex(http_client=http_client)
         message = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=8192,

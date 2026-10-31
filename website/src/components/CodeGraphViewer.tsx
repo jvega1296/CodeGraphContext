@@ -372,6 +372,73 @@ function TreeItem({
   );
 }
 
+// ─── Flow View Layout ─────────────────────────────────────────────────────────
+// BFS-depth-based tiered layout for AI-query/flow results (no library dependency).
+// Seed = matched node with the most edges within the matched set.
+// Downstream direction (source → target along edge): depth +1 (columns to the right).
+// Upstream direction (target → source, i.e. callers of seed): depth -1 (columns to the left).
+function computeFlowLayout(
+  matchedNodeIds: Set<number>,
+  matchedLinks: Set<any>,
+): Map<number, { x: number; y: number }> {
+  if (matchedNodeIds.size === 0) return new Map();
+
+  const outEdges = new Map<number, number[]>();
+  const inEdges = new Map<number, number[]>();
+  for (const id of matchedNodeIds) { outEdges.set(id, []); inEdges.set(id, []); }
+
+  for (const link of matchedLinks) {
+    const src = typeof link.source === 'object' ? link.source.id : link.source;
+    const tgt = typeof link.target === 'object' ? link.target.id : link.target;
+    if (matchedNodeIds.has(src) && matchedNodeIds.has(tgt)) {
+      outEdges.get(src)?.push(tgt);
+      inEdges.get(tgt)?.push(src);
+    }
+  }
+
+  // Pick seed: node with highest degree within matched set
+  let seedId = Array.from(matchedNodeIds)[0];
+  let maxDeg = -1;
+  for (const id of matchedNodeIds) {
+    const deg = (outEdges.get(id)?.length ?? 0) + (inEdges.get(id)?.length ?? 0);
+    if (deg > maxDeg) { maxDeg = deg; seedId = id; }
+  }
+
+  // BFS with signed depths (seed = 0, downstream = +, upstream = -)
+  const depths = new Map<number, number>();
+  depths.set(seedId, 0);
+  const queue = [seedId];
+  while (queue.length > 0) {
+    const curr = queue.shift()!;
+    const d = depths.get(curr)!;
+    for (const tgt of (outEdges.get(curr) ?? [])) {
+      if (!depths.has(tgt)) { depths.set(tgt, d + 1); queue.push(tgt); }
+    }
+    for (const src of (inEdges.get(curr) ?? [])) {
+      if (!depths.has(src)) { depths.set(src, d - 1); queue.push(src); }
+    }
+  }
+  for (const id of matchedNodeIds) { if (!depths.has(id)) depths.set(id, 0); }
+
+  // Group nodes by depth tier
+  const tiers = new Map<number, number[]>();
+  for (const [id, d] of depths) {
+    if (!tiers.has(d)) tiers.set(d, []);
+    tiers.get(d)!.push(id);
+  }
+
+  // Lay out columns: depth × TIER_SPACING gives x; nodes spaced evenly in y
+  const TIER_SPACING = 280;
+  const NODE_SPACING = 90;
+  const positions = new Map<number, { x: number; y: number }>();
+  for (const [depth, ids] of tiers) {
+    const x = depth * TIER_SPACING;
+    const totalH = (ids.length - 1) * NODE_SPACING;
+    ids.forEach((id, i) => { positions.set(id, { x, y: i * NODE_SPACING - totalH / 2 }); });
+  }
+  return positions;
+}
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 const MIN_SIDEBAR_W = 180;
 const MAX_SIDEBAR_W = 520;
@@ -443,6 +510,10 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
 
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [focusSet, setFocusSet] = useState<{ nodes: Set<number>, links: Set<any> } | null>(null);
+  // isFlowView distinguishes AI-query/flow focus (full-hide + layered layout + arrows)
+  // from impact-mode focus (existing fade-only behavior). Only highlightAIQueryResultNodes sets this true.
+  const [isFlowView, setIsFlowView] = useState(false);
+  const [flowPositions, setFlowPositions] = useState<Map<number, { x: number; y: number }> | null>(null);
   const [simulationReady, setSimulationReady] = useState(false);
   const fa2WorkerRef = useRef<InstanceType<typeof FA2LayoutSupervisor> | null>(null);
   const [fa2Positions, setFa2Positions] = useState<Map<number, { x: number; y: number }> | null>(null);
@@ -853,12 +924,47 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     return () => window.removeEventListener('keydown', onKey);
   }, [isImpactMode, impactResult]);
 
+  // Clear isFlowView whenever focusSet is cleared by any exit path (chat panel close, impact mode,
+  // file click, path traversal, etc.). Only highlightAIQueryResultNodes sets isFlowView=true, so
+  // this effect is the single canonical exit point that restores normal global-layout behavior.
+  useEffect(() => {
+    if (focusSet === null) {
+      setIsFlowView(false);
+      setFlowPositions(null);
+    }
+  }, [focusSet]);
+
+  // Compute BFS-depth layered layout whenever flow view becomes active with a new focusSet.
+  useEffect(() => {
+    if (!isFlowView || !focusSet || focusSet.nodes.size === 0) {
+      setFlowPositions(null);
+      return;
+    }
+    setFlowPositions(computeFlowLayout(focusSet.nodes, focusSet.links));
+  }, [isFlowView, focusSet]);
+
+  // After flow positions are applied, fit the camera to the newly-positioned flow subgraph.
+  useEffect(() => {
+    if (!isFlowView || !flowPositions || flowPositions.size === 0) return;
+    const timer = setTimeout(() => {
+      if (!fgRef.current) return;
+      // zoomToFit(duration, padding, nodeFilter) -- scoped to flow nodes only.
+      fgRef.current.zoomToFit(600, 80, (node: any) => flowPositions.has(node.id));
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [flowPositions, isFlowView]);
+
   const nodeCanvasObject = useCallback((node: any, ctx: any, globalScale: number) => {
     if (!visibleNodeTypes.has(node.type)) return;
     if (!Number.isFinite(node.x) || !Number.isFinite(node.y)) return;
 
     const isHovered = hoverNode && node.id === hoverNode.id;
     const isFocused = focusSet ? focusSet.nodes.has(node.id) : true;
+
+    // FLOW VIEW: skip rendering non-matched nodes entirely (full hide, not fade).
+    // Impact-mode keeps the existing fade-to-opacity-0.05 behavior via the opacity line below.
+    if (isFlowView && !isFocused) return;
+
     let baseColor = nodeColors[node.type] || nodeColors.Other;
     // Size multiplier for impact mode: target scales with risk_score, affected nodes scale with depth proximity.
     let impactSizeFactor = 1.0;
@@ -1009,7 +1115,13 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
       }
     }
 
-    const showLabel = isHovered || (isFocused && globalScale > (isMassive ? 5.0 : 2.0));
+    // FLOW VIEW: always render labels for matched nodes when the set is small enough to be legible.
+    // Threshold of 60: above this the labels overlap at any reasonable zoom; let the zoom gate apply.
+    // This only affects flow view; impact mode and full-graph default keep the existing zoom gate.
+    const FLOW_LABEL_LIMIT = 60;
+    const showLabel = isHovered ||
+      (isFocused && globalScale > (isMassive ? 5.0 : 2.0)) ||
+      (isFlowView && isFocused && focusSet !== null && focusSet.nodes.size <= FLOW_LABEL_LIMIT);
 
     if (showLabel) {
       const fontSize = Math.max(2, Math.round((isHovered ? 14 : 10) / globalScale));
@@ -1024,7 +1136,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
       ctx.fillText(node.name || 'Unknown', node.x, labelY);
       if (isFocused && !isMassive) ctx.shadowBlur = 0;
     }
-  }, [filteredData.nodes.length, focusSet, graphAwareNodeScale, hoverNode, nodeColors, nodeSize, selectedFile, visibleNodeTypes, graphMode, degreeMap, pal, isDark, isImpactMode, impactResult, impactTarget]);
+  }, [filteredData.nodes.length, focusSet, isFlowView, graphAwareNodeScale, hoverNode, nodeColors, nodeSize, selectedFile, visibleNodeTypes, graphMode, degreeMap, pal, isDark, isImpactMode, impactResult, impactTarget]);
 
   const cityNodeThreeObject = useCallback((node: any) => {
     if (!visibleNodeTypes.has(node.type)) return new THREE.Object3D();
@@ -1379,6 +1491,24 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
       links: filteredData.links,
     };
   }, [fa2Positions, filteredData]);
+
+  // When flow view is active, overlay computed flow positions (x/y/fx/fy) on matched nodes only.
+  // Setting x AND y (not just fx/fy) ensures zoomToFit reads the correct positions even with 0 ticks.
+  // Non-matched nodes keep their existing positions; they are hidden in nodeCanvasObject anyway.
+  // When flow view exits (isFlowView=false or flowPositions=null), this returns the base data
+  // unchanged, so nodes restore their normal global-layout-driven positions automatically.
+  const activeGraphData = useMemo(() => {
+    const base = fa2GraphData || filteredData;
+    if (!isFlowView || !flowPositions) return base;
+    return {
+      nodes: base.nodes.map((n: any) => {
+        const fp = flowPositions.get(n.id);
+        if (!fp) return n;
+        return { ...n, x: fp.x, y: fp.y, fx: fp.x, fy: fp.y };
+      }),
+      links: base.links,
+    };
+  }, [isFlowView, flowPositions, fa2GraphData, filteredData]);
 
   const loadFileCode = useCallback((path: string) => {
     const content = fileContents[path];
@@ -1839,27 +1969,11 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
       }
     });
 
+    // Activate flow view: dedicated layered layout + full-hide + arrows.
+    // Camera fit is handled by the flowPositions effect (zoomToFit with nodeFilter)
+    // after computeFlowLayout runs and activeGraphData applies the positions.
+    setIsFlowView(true);
     setFocusSet({ nodes: pathNodes, links: pathLinks });
-
-    // Center and zoom on focused nodes
-    if (pathNodes.size > 0 && fgRef.current) {
-      let totalX = 0;
-      let totalY = 0;
-      let count = 0;
-      filteredData.nodes.forEach((node: any) => {
-        if (pathNodes.has(node.id) && Number.isFinite(node.x) && Number.isFinite(node.y)) {
-          totalX += node.x;
-          totalY += node.y;
-          count++;
-        }
-      });
-      if (count > 0) {
-        const avgX = totalX / count;
-        const avgY = totalY / count;
-        fgRef.current.centerAt(avgX, avgY, 800);
-        fgRef.current.zoom(2.0, 800);
-      }
-    }
   }, [aiResponse, filteredData]);
 
   const handleAIQuerySubmit = useCallback(async () => {
@@ -1925,6 +2039,9 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     const isFocused = focusSet ? focusSet.links.has(link) : true;
     const baseColor = edgeColors[link.type] || '#ffffff';
 
+    // FLOW VIEW: fully hide non-matched links (match the full-hide approach for nodes).
+    if (isFlowView && !isFocused) return 'rgba(0,0,0,0)';
+
     if (graphMode === 'galaxy') {
       return isFocused
         ? (baseColor.startsWith('#') ? getRGBA(baseColor, 0.25) : 'rgba(255,255,255,0.25)')
@@ -1935,7 +2052,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     }
     if (!isFocused) return 'rgba(255, 255, 255, 0.02)';
     return baseColor;
-  }, [focusSet, edgeColors, graphMode]);
+  }, [focusSet, isFlowView, edgeColors, graphMode]);
 
   const effectiveSidebarW = (collapsed || dimensions.width < 768) ? 0 : sidebarWidth;
   const effectiveCodePanelW = (selectedFile === null || dimensions.width < 768) ? 0 : codePanelWidth;
@@ -2967,7 +3084,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
             // onEngineStop fires immediately when cooldownTicks=0 (large graph with fixed positions),
             // preserving the prior task's auto-fit camera behavior for both paths.
             onEngineStop={() => { setSimulationReady(true); autoFitCamera(); }}
-            graphData={fa2GraphData || filteredData}
+            graphData={activeGraphData}
             width={dimensions.width - effectiveSidebarW - effectiveCodePanelW}
             height={dimensions.height}
             nodeLabel={(n: any) => {
@@ -2985,12 +3102,20 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
                   : lineWidth
             }
             linkDirectionalParticles={
-              graphMode === 'galaxy'
+              isFlowView
                 ? 0
-                : (l: any) => (focusSet ? (focusSet.links.has(l) ? 2 : 0) : (filteredData.links.length > 500 ? 0 : 1))
+                : graphMode === 'galaxy'
+                  ? 0
+                  : (l: any) => (focusSet ? (focusSet.links.has(l) ? 2 : 0) : (filteredData.links.length > 500 ? 0 : 1))
             }
             linkDirectionalParticleWidth={lineWidth * 1.5}
             linkDirectionalParticleSpeed={0.005}
+            linkDirectionalArrowLength={(link: any) => {
+              if (!isFlowView || !focusSet) return 0;
+              return focusSet.links.has(link) ? 6 : 0;
+            }}
+            linkDirectionalArrowRelPos={1}
+            linkDirectionalArrowColor={(link: any) => edgeColors[link.type] || '#ffffff'}
             nodeCanvasObject={nodeCanvasObject}
             nodePointerAreaPaint={(node: any, color: string, ctx: any, globalScale: number) => {
               let hitSize = 0;

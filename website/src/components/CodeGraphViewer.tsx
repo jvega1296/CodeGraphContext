@@ -514,6 +514,9 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   // from impact-mode focus (existing fade-only behavior). Only highlightAIQueryResultNodes sets this true.
   const [isFlowView, setIsFlowView] = useState(false);
   const [flowPositions, setFlowPositions] = useState<Map<number, { x: number; y: number }> | null>(null);
+  // Ref (not state) so onEngineStop can read the latest nodeIds without a stale closure.
+  // Set alongside flowPositions; cleared once consumed by onEngineStop.
+  const pendingFlowFitRef = useRef<Set<number> | null>(null);
   const [simulationReady, setSimulationReady] = useState(false);
   const fa2WorkerRef = useRef<InstanceType<typeof FA2LayoutSupervisor> | null>(null);
   const [fa2Positions, setFa2Positions] = useState<Map<number, { x: number; y: number }> | null>(null);
@@ -935,24 +938,19 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   }, [focusSet]);
 
   // Compute BFS-depth layered layout whenever flow view becomes active with a new focusSet.
+  // Sets pendingFlowFitRef so the next onEngineStop fires zoomToFit against the actual settled
+  // positions -- no fixed timer, no race against the graph re-initializing with new activeGraphData.
   useEffect(() => {
     if (!isFlowView || !focusSet || focusSet.nodes.size === 0) {
       setFlowPositions(null);
+      pendingFlowFitRef.current = null;
       return;
     }
-    setFlowPositions(computeFlowLayout(focusSet.nodes, focusSet.links));
+    const positions = computeFlowLayout(focusSet.nodes, focusSet.links);
+    setFlowPositions(positions);
+    // Store nodeIds so onEngineStop can call zoomToFit with a nodeFilter without a stale closure.
+    pendingFlowFitRef.current = new Set(positions.keys());
   }, [isFlowView, focusSet]);
-
-  // After flow positions are applied, fit the camera to the newly-positioned flow subgraph.
-  useEffect(() => {
-    if (!isFlowView || !flowPositions || flowPositions.size === 0) return;
-    const timer = setTimeout(() => {
-      if (!fgRef.current) return;
-      // zoomToFit(duration, padding, nodeFilter) -- scoped to flow nodes only.
-      fgRef.current.zoomToFit(600, 80, (node: any) => flowPositions.has(node.id));
-    }, 120);
-    return () => clearTimeout(timer);
-  }, [flowPositions, isFlowView]);
 
   const nodeCanvasObject = useCallback((node: any, ctx: any, globalScale: number) => {
     if (!visibleNodeTypes.has(node.type)) return;
@@ -3081,9 +3079,20 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
         ) : (
           <ForceGraph2D
             ref={fgRef}
-            // onEngineStop fires immediately when cooldownTicks=0 (large graph with fixed positions),
-            // preserving the prior task's auto-fit camera behavior for both paths.
-            onEngineStop={() => { setSimulationReady(true); autoFitCamera(); }}
+            // onEngineStop fires immediately when cooldownTicks=0 (large graph with fixed positions).
+            // When a flow-view layout is pending, zoomToFit is scoped to matched nodes via nodeFilter
+            // instead of the whole-graph autoFitCamera, so the camera is guaranteed to fit the flow
+            // at the same moment the physics has actually settled (no fixed-timer race).
+            onEngineStop={() => {
+              setSimulationReady(true);
+              const flowNodeIds = pendingFlowFitRef.current;
+              if (flowNodeIds && flowNodeIds.size > 0) {
+                pendingFlowFitRef.current = null;
+                fgRef.current?.zoomToFit(600, 80, (node: any) => flowNodeIds.has(node.id));
+              } else {
+                autoFitCamera();
+              }
+            }}
             graphData={activeGraphData}
             width={dimensions.width - effectiveSidebarW - effectiveCodePanelW}
             height={dimensions.height}
@@ -3118,6 +3127,10 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
             linkDirectionalArrowColor={(link: any) => edgeColors[link.type] || '#ffffff'}
             nodeCanvasObject={nodeCanvasObject}
             nodePointerAreaPaint={(node: any, color: string, ctx: any, globalScale: number) => {
+              // FLOW VIEW: remove hidden nodes from hit-testing so invisible nodes don't generate
+              // tooltips or absorb clicks. Mirrors the nodeCanvasObject early-return guard.
+              if (isFlowView && !focusSet?.nodes.has(node.id)) return;
+
               let hitSize = 0;
               if (graphMode === 'icon') {
                 hitSize = Math.max(14 / globalScale, (node.val || 1) * 2);

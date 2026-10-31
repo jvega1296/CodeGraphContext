@@ -11,11 +11,11 @@ import { useParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
   ArrowLeft, ZoomIn, ZoomOut, Maximize, FileCode, Search,
-  Eye, EyeOff, Settings2, Palette, Star,
+  Eye, EyeOff, Settings2, Palette,
   ChevronRight, ChevronDown, Folder, FolderOpen,
   PanelLeftClose, PanelLeftOpen,
   Layers, Check, X, Code2, Sun, Moon, ChevronUp, Route,
-  Download, UploadCloud, Menu, MessageSquare, Copy, Loader2, Zap, Flame, AlertTriangle
+  Download, UploadCloud, Menu, MessageSquare, Loader2, Zap, Flame, AlertTriangle
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useTheme } from "next-themes";
@@ -24,7 +24,6 @@ import { packageCgcBundle, downloadBlob, publishCgcBundle } from "../lib/cgc-exp
 import { exportSvg } from "../lib/svg-exporter";
 import { packageInteractiveExport } from "../lib/html-exporter";
 import { toast } from "sonner";
-import { getOrCreateSessionId } from "../lib/utils";
 import { generateNodeSummary, type NodeSummary, loadLLMConfig, saveLLMConfig, type LLMConfig, executeClientAIQuery } from "../lib/summary-engine";
 import {
   AlertDialog,
@@ -467,7 +466,6 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   const { owner, repo } = useParams();
   const defaultRepoName = data.metadata?.repo || (owner && repo ? `${owner}/${repo}` : "");
   const [showPublishModal, setShowPublishModal] = useState(false);
-  const [showChatGPTModal, setShowChatGPTModal] = useState(false);
   const [publishRepo, setPublishRepo] = useState("");
   const [publishVersion, setPublishVersion] = useState("1.0.0");
   const [isPublishing, setIsPublishing] = useState(false);
@@ -489,28 +487,6 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
   const designedRepoName = cleanOwner && cleanRepo
     ? `${cleanOwner}__${cleanRepo}__${branchName}__${cleanCommit}`
     : repoName;
-
-  const userId = getOrCreateSessionId();
-  const chatgptPreFillPrompt = `Let's connect to codegraphcontext session: ${userId}`;
-  const chatgptUrl = "https://chatgpt.com/g/g-6a1368599210819199a1c47d021020b6-codegraphcontext";
-
-  const handleConnectChatGPT = () => {
-    setShowChatGPTModal(true);
-  };
-
-  const handleCopyAndLaunchChatGPT = () => {
-    navigator.clipboard.writeText(chatgptPreFillPrompt)
-      .then(() => {
-        toast.success("Prompt copied to clipboard!", {
-          icon: "📋",
-        });
-      })
-      .catch((err) => {
-        console.warn("Failed to auto-copy prompt:", err);
-      });
-    window.open(chatgptUrl, "_blank", "noopener,noreferrer");
-    setShowChatGPTModal(false);
-  };
 
   const handleExport = async () => {
     try {
@@ -2737,18 +2713,6 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
               </AnimatePresence>
             </div>
 
-            <a
-              href="https://github.com/CodeGraphContext/CodeGraphContext"
-              target="_blank"
-              rel="noopener noreferrer"
-              className={`flex items-center gap-2 text-[11px] uppercase tracking-widest font-bold px-4 py-2 border rounded-full transition-all backdrop-blur-md shadow-2xl ${isDark ? 'bg-black/40 hover:bg-purple-500/20 text-white border-white/10' : 'bg-white/80 hover:bg-white text-gray-800 border-black/10'}`}
-            >
-              <Star className="w-3.5 h-3.5 text-yellow-400 fill-yellow-400" />
-              Star on GitHub
-            </a>
-            <div className={`text-[11px] uppercase tracking-widest font-bold px-4 py-2 border rounded-full backdrop-blur-md shadow-2xl ${isDark ? 'bg-black/40 text-gray-400 border-white/10' : 'bg-white/80 text-gray-500 border-black/10'}`}>
-              Made by <a href="https://github.com/shashankss1205" target="_blank" rel="noopener noreferrer" className="text-purple-400 hover:text-purple-300 transition-colors">shashankss1205</a>
-            </div>
           </div>
 
           {/* Mobile Hamburger Menu Toggle */}
@@ -2812,21 +2776,6 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
                   Publish Graph
                 </button>
 
-                {/* Mobile ChatGPT Tunnel — only when no backend is configured */}
-                {!backendParam && (
-                  <button
-                    onClick={() => {
-                      handleConnectChatGPT();
-                      setShowMobileMenu(false);
-                    }}
-                    className={`flex items-center gap-2 text-[11px] uppercase tracking-widest font-bold px-4 py-2 border rounded-xl transition-all text-left w-full ${isDark ? 'hover:bg-purple-500/10 border-white/5 text-white' : 'hover:bg-black/5 border-black/5 text-gray-800'}`}
-                  >
-                    <div className="w-2 h-2 rounded-full bg-amber-500/80 shadow-[0_0_6px_#f59e0b]" />
-                    <MessageSquare className="w-3.5 h-3.5 text-purple-400" />
-                    ChatGPT Tunnel
-                  </button>
-                )}
-
                 {/* Mobile Mode Selector */}
                 <div className="border-t border-white/5 my-0.5" />
                 <div className="px-2 text-[8px] uppercase tracking-widest font-bold text-gray-500">Visualization Mode</div>
@@ -2847,23 +2796,6 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
                   </button>
                 ))}
 
-                {/* Mobile Star */}
-                <div className="border-t border-white/5 my-0.5" />
-                <a
-                  href="https://github.com/CodeGraphContext/CodeGraphContext"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className={`flex items-center gap-2 text-[11px] uppercase tracking-widest font-bold px-4 py-2 border rounded-xl transition-all ${isDark ? 'hover:bg-purple-500/10 border-white/5 text-white' : 'hover:bg-black/5 border-black/5 text-gray-850'}`}
-                  onClick={() => setShowMobileMenu(false)}
-                >
-                  <Star className="w-3.5 h-3.5 text-yellow-400 fill-yellow-400" />
-                  Star on GitHub
-                </a>
-
-                {/* Mobile Made By */}
-                <div className="text-[9px] uppercase tracking-widest text-center mt-1 text-gray-500 py-1 border-t border-white/5">
-                  Made by <a href="https://github.com/shashankss1205" target="_blank" rel="noopener noreferrer" className="text-purple-400 hover:text-purple-300 font-bold transition-colors">shashankss1205</a>
-                </div>
               </motion.div>
             )}
           </AnimatePresence>
@@ -2879,24 +2811,12 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
               transition={{ duration: 0.18 }}
               className="absolute bottom-6 right-6 z-[65] w-[400px] max-w-[calc(100vw-80px)]"
             >
-              <div className={`flex items-center justify-between mb-1.5 px-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
-                <span className="text-[10px] font-black uppercase tracking-widest flex items-center gap-1.5">
-                  <MessageSquare className="w-3 h-3 text-purple-400" />
-                  Ask Claude about this graph
-                </span>
-                <button
-                  onClick={() => setShowChatPanel(false)}
-                  className="p-0.5 rounded hover:text-white transition-colors"
-                  title="Close"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
               <CodeGraphChatPanel
                 backendUrl={backendParam}
                 repoPath={repoPathParam}
                 isDark={isDark}
                 onGraphResult={handleChatPanelGraphResult}
+                onClose={() => setShowChatPanel(false)}
               />
             </motion.div>
           )}
@@ -3101,7 +3021,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
           >
             {/* Legend Overlay */}
             <div
-              className={`pointer-events-auto backdrop-blur-3xl border rounded-2xl shadow-2xl ${isDark ? 'bg-black/50 border-white/10' : 'bg-white/80 border-black/10'}`}
+              className={`pointer-events-auto backdrop-blur-xl border rounded-2xl shadow-2xl ${isDark ? 'bg-black/60 border-white/10' : 'bg-white/80 border-black/10'}`}
             >
               <div
                 className={`flex items-center justify-between px-5 pt-4 ${legendCollapsed ? 'pb-4' : 'pb-2'} cursor-pointer transition-colors rounded-t-2xl ${isDark ? 'hover:bg-purple-500/10' : 'hover:bg-black/5'}`}
@@ -3352,13 +3272,11 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
               initial={{ opacity: 0, scale: 0.95, y: 10 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              className={`relative w-full max-w-md p-6 rounded-3xl shadow-2xl border backdrop-blur-2xl overflow-hidden ${isDark
+              className={`w-full max-w-md p-6 rounded-3xl shadow-2xl border backdrop-blur-2xl ${isDark
                   ? "bg-zinc-950/80 border-zinc-800 text-white"
                   : "bg-white/90 border-zinc-200 text-zinc-900"
                 }`}
             >
-              {/* Subtle top glow bar */}
-              <div className="absolute top-0 left-0 right-0 h-1 bg-white" />
 
               <div className="flex justify-between items-start mb-6">
                 <div>
@@ -3445,107 +3363,9 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
         )}
       </AnimatePresence>
 
-      {/* ── CHATGPT CONNECTION INSTRUCTION MODAL ── */}
-      <AnimatePresence>
-        {showChatGPTModal && (
-          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4">
-            {/* Backdrop */}
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => setShowChatGPTModal(false)}
-              className="absolute inset-0 bg-black/60 backdrop-blur-md"
-            />
-
-            {/* Dialog Panel */}
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 10 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              className={`relative w-full max-w-md p-6 rounded-3xl shadow-2xl border backdrop-blur-2xl overflow-hidden ${isDark
-                  ? "bg-zinc-950/80 border-zinc-800 text-white"
-                  : "bg-white/90 border-zinc-200 text-zinc-900"
-                }`}
-            >
-              {/* Subtle top glow bar */}
-              <div className="absolute top-0 left-0 right-0 h-1 bg-white" />
-
-              <div className="flex justify-between items-start mb-6">
-                <div>
-                  <h3 className="text-lg font-bold tracking-tight flex items-center gap-2">
-                    <MessageSquare className="w-5 h-5 text-purple-400" />
-                    Connect to ChatGPT GPT
-                  </h3>
-                  <p className={`text-xs mt-1 ${isDark ? "text-zinc-400" : "text-zinc-500"}`}>
-                    To link ChatGPT to this browser tunnel, you need to paste a setup prompt.
-                  </p>
-                </div>
-                <button
-                  onClick={() => setShowChatGPTModal(false)}
-                  className={`p-1.5 rounded-full transition-colors ${isDark ? "hover:bg-purple-500/20 text-zinc-400 hover:text-white" : "hover:bg-zinc-100 text-zinc-500 hover:text-zinc-950"
-                    }`}
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              <div className="space-y-4">
-                <div className="space-y-1.5">
-                  <label className="text-[10px] uppercase font-bold tracking-wider text-zinc-400 block">
-                    Connection Prompt (Auto-copied on Launch)
-                  </label>
-                  <div className={`relative p-3 rounded-xl border font-mono text-xs flex justify-between items-center ${isDark ? "bg-zinc-900/60 border-zinc-800 text-zinc-300" : "bg-zinc-50 border-zinc-200 text-zinc-700"
-                    }`}>
-                    <span className="select-all break-all pr-8">{chatgptPreFillPrompt}</span>
-                    <button
-                      onClick={() => {
-                        navigator.clipboard.writeText(chatgptPreFillPrompt);
-                        toast.success("Prompt copied to clipboard!", { icon: "📋" });
-                      }}
-                      className={`absolute right-2 p-1.5 rounded-lg transition-colors ${isDark ? "hover:bg-purple-500/10 text-zinc-400 hover:text-white" : "hover:bg-zinc-200 text-zinc-600 hover:text-zinc-900"
-                        }`}
-                      title="Copy prompt to clipboard"
-                    >
-                      <Copy className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                </div>
-
-                <div className={`p-3 rounded-xl border text-xs leading-relaxed ${isDark ? "bg-amber-950/20 border-amber-900/40 text-amber-300" : "bg-amber-50 border-amber-200/60 text-amber-800"
-                  }`}>
-                  <p className="font-semibold mb-1">💡 Important Instruction:</p>
-                  <p>When the ChatGPT window loads, click on the chat box, press <kbd className="px-1 py-0.5 rounded border border-current font-sans text-[10px]">Ctrl+V</kbd> (or <kbd className="px-1 py-0.5 rounded border border-current font-sans text-[10px]">Cmd+V</kbd>) to paste the copied prompt, and hit enter!</p>
-                </div>
-
-                <div className="pt-2 flex gap-3">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => setShowChatGPTModal(false)}
-                    className="w-full rounded-xl"
-                  >
-                    Cancel
-                  </Button>
-                  <Button
-                    type="button"
-                    onClick={handleCopyAndLaunchChatGPT}
-                    className="w-full rounded-xl bg-purple-600 text-white hover:bg-purple-500 shadow-[0_0_15px_rgba(168,85,247,0.4)] flex items-center justify-center gap-2"
-                  >
-                    Copy & Open ChatGPT
-                  </Button>
-                </div>
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
       {/* Already Pre-indexed Bundle Warning Dialog */}
       <AlertDialog open={showWarningAlert} onOpenChange={setShowWarningAlert}>
-        <AlertDialogContent className="bg-zinc-950 border border-zinc-800 text-zinc-100 max-w-md rounded-3xl shadow-2xl p-6 relative overflow-hidden backdrop-blur-2xl">
-          {/* Subtle top glow bar */}
-          <div className="absolute top-0 left-0 right-0 h-1 bg-white" />
+        <AlertDialogContent className="bg-zinc-950 border border-zinc-800 text-zinc-100 max-w-md rounded-3xl shadow-2xl p-6 backdrop-blur-2xl">
 
           <AlertDialogHeader>
             <AlertDialogTitle className="text-lg font-bold tracking-tight text-white flex items-center gap-2">

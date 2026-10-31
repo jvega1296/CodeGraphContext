@@ -99,7 +99,7 @@ const DEFAULT_NODE_COLORS: Record<string, string> = {
   // -600 Tailwind shades: ≥3:1 contrast against both #f5f5f7 (light canvas) and #020202 (dark canvas).
   Topic: '#c026d3',
   Subscription: '#0891b2',
-  Endpoint: '#65a30d',
+  Endpoint: '#4d7c0f',
 };
 
 const DEFAULT_EDGE_COLORS: Record<string, string> = {

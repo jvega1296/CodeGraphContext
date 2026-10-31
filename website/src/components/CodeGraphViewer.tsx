@@ -889,7 +889,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     if (isImpactMode && impactResult) {
       if (node.id === impactTarget?.id) {
         baseColor = '#ef4444'; // Target is Crimson Red
-        impactSizeFactor = 1.5 + (impactResult.risk_score || 0) * 1.5; // 1.5x–3x by risk_score
+        impactSizeFactor = 1.5 + (impactResult.risk_score ?? 0) * 1.5; // 1.5x–3x by risk_score
       } else {
         const affected = impactResult.affected_nodes?.find((n: any) => n.uid === node.id);
         if (affected) {
@@ -1055,22 +1055,27 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     // Directories and Repository are represented by platforms, not buildings
     if (node.type === 'Directory' || node.type === 'Repository') return new THREE.Object3D();
 
+    const isFocused = focusSet ? focusSet.nodes.has(node.id) : true;
     let color = nodeColors[node.type] || nodeColors.Other;
+    let cityImpactFactor = 1.0;
     if (isImpactMode && impactResult) {
       if (node.id === impactTarget?.id) {
         color = '#ef4444';
+        cityImpactFactor = 1.5 + (impactResult.risk_score ?? 0) * 1.5;
       } else {
         const affected = impactResult.affected_nodes?.find((n: any) => n.uid === node.id);
         if (affected) {
           color = affected.depth === 1 ? '#f97316' : '#eab308';
+          cityImpactFactor = affected.depth === 1 ? 1.7 : 1.3;
         }
       }
     }
     const degree = degreeMap.get(node.id) || 0;
     const baseH = CITY_HEIGHTS[node.type] || 4;
-    const bHeight = Math.max(1.5, (baseH + degree * 0.5) * nodeSize * 0.5);
+    const bHeight = Math.max(1.5, (baseH + degree * 0.5) * nodeSize * 0.5) * cityImpactFactor;
     const bWidth = Math.max(1.8, 2.2 + (node.val || 2) * 0.15);
     const pTop = node.__platformTop || 0;
+    const opacity = isFocused ? 1.0 : 0.08;
 
     // Main building body
     const geo = new THREE.BoxGeometry(bWidth, bHeight, bWidth);
@@ -1078,13 +1083,15 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
       color: new THREE.Color(color),
       shininess: 40,
       specular: new THREE.Color(0x222222),
+      transparent: !isFocused,
+      opacity,
     });
     const building = new THREE.Mesh(geo, mat);
     building.position.y = pTop + bHeight / 2;
 
     // Wireframe edge overlay
     const edgeGeo = new THREE.EdgesGeometry(geo);
-    const edgeMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.08 });
+    const edgeMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: isFocused ? 0.08 : 0.02 });
     const wireframe = new THREE.LineSegments(edgeGeo, edgeMat);
     wireframe.position.y = pTop + bHeight / 2;
 
@@ -1093,7 +1100,9 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     const roofMat = new THREE.MeshPhongMaterial({
       color: new THREE.Color(color),
       emissive: new THREE.Color(color),
-      emissiveIntensity: 0.6,
+      emissiveIntensity: isFocused ? 0.6 : 0.05,
+      transparent: !isFocused,
+      opacity,
     });
     const roof = new THREE.Mesh(roofGeo, roofMat);
     roof.position.y = pTop + bHeight;
@@ -1103,7 +1112,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     group.add(wireframe);
     group.add(roof);
     return group;
-  }, [nodeColors, nodeSize, degreeMap, visibleNodeTypes, isImpactMode, impactResult, impactTarget]);
+  }, [nodeColors, nodeSize, degreeMap, visibleNodeTypes, focusSet, isImpactMode, impactResult, impactTarget]);
 
   const graph3dNodeThreeObject = useCallback((node: any) => {
     if (!visibleNodeTypes.has(node.type)) return new THREE.Object3D();
@@ -1119,24 +1128,26 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
         }
       }
     }
+    const isFocused = focusSet ? focusSet.nodes.has(node.id) : true;
     const degree = degreeMap.get(node.id) || 0;
     let r3dFactor = 1.0;
     if (isImpactMode && impactResult) {
-      if (node.id === impactTarget?.id) r3dFactor = 1.5 + (impactResult.risk_score || 0) * 1.5;
+      if (node.id === impactTarget?.id) r3dFactor = 1.5 + (impactResult.risk_score ?? 0) * 1.5;
       else {
         const aff = impactResult.affected_nodes?.find((n: any) => n.uid === node.id);
         if (aff) r3dFactor = aff.depth === 1 ? 1.7 : 1.3;
       }
     }
     const radius = Math.max(1.5, (node.val || 2) * 0.6 * nodeSize + degree * 0.15) * r3dFactor;
+    const sphereOpacity = isFocused ? 0.92 : 0.09;
 
     const sphereGeo = new THREE.SphereGeometry(radius, 16, 12);
     const sphereMat = new THREE.MeshPhongMaterial({
       color: new THREE.Color(color),
       emissive: new THREE.Color(color),
-      emissiveIntensity: 0.35,
+      emissiveIntensity: isFocused ? 0.35 : 0.04,
       transparent: true,
-      opacity: 0.92,
+      opacity: sphereOpacity,
       shininess: 80,
     });
     const sphere = new THREE.Mesh(sphereGeo, sphereMat);
@@ -1145,7 +1156,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     const glowMat = new THREE.MeshBasicMaterial({
       color: new THREE.Color(color),
       transparent: true,
-      opacity: 0.08,
+      opacity: isFocused ? 0.08 : 0.01,
       side: THREE.BackSide,
     });
     const glow = new THREE.Mesh(glowGeo, glowMat);
@@ -1155,7 +1166,7 @@ export default function CodeGraphViewer({ data: rawData, onClose }: { data: any,
     group.add(glow);
 
     return group;
-  }, [nodeColors, nodeSize, degreeMap, visibleNodeTypes, isImpactMode, impactResult, impactTarget]);
+  }, [nodeColors, nodeSize, degreeMap, visibleNodeTypes, focusSet, isImpactMode, impactResult, impactTarget]);
 
   const graph3dLinkColor = useCallback((link: any) => {
     const baseColor = edgeColors[link.type] || '#ffffff';
